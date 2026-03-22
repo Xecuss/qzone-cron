@@ -21,23 +21,42 @@ def save_cookies(cookie_file: Path, cookies: dict[str, str]) -> None:
         json.dump(cookies, f, indent=2)
 
 
+def _print_qr_terminal(png: bytes) -> None:
+    """将 QR 二维码 PNG 渲染为终端半块字符并打印到 stdout。"""
+    import io as _io
+
+    from PIL import Image
+
+    img = Image.open(_io.BytesIO(png)).convert("1")  # 转为 1-bit 黑白
+    w, h = img.size
+    # 每两行合并为一行（上半块 ▀ / 下半块 ▄ / 实心 █ / 空格）
+    print()
+    for y in range(0, h, 2):
+        row = ""
+        for x in range(w):
+            top = img.getpixel((x, y)) == 0       # 0 = 黑色模块
+            bot = img.getpixel((x, y + 1)) == 0 if y + 1 < h else False
+            if top and bot:
+                row += "█"
+            elif top:
+                row += "▀"
+            elif bot:
+                row += "▄"
+            else:
+                row += " "
+        print(row)
+    print()
+
+
 async def setup_login(uin: int, cookie_file: Path) -> None:
     """交互式二维码登录，将 cookie 保存至文件。"""
     import asyncio
-    import io
 
     from aioqzone.api.login import QrLoginManager
     from aioqzone.model.protocol.config import QrLoginConfig
     from qqqr.utils.net import ClientAdapter
 
-    try:
-        from PIL import Image
-        has_pil = True
-    except ImportError:
-        has_pil = False
-
     qr_path = Path("qrcode.png")
-    login_done = asyncio.Event()
 
     async with ClientAdapter() as client:
         mgr = QrLoginManager(client, config=QrLoginConfig(uin=uin))
@@ -45,12 +64,14 @@ async def setup_login(uin: int, cookie_file: Path) -> None:
         async def on_qr_fetched(png: bytes | None, times: int, qr_renew: bool = False) -> None:
             if png is None:
                 return
-            if has_pil:
-                Image.open(io.BytesIO(png)).show()
-                logger.info("二维码已弹出，请用 QQ 扫描。")
-            else:
-                qr_path.write_bytes(png)
-                logger.info("二维码已保存至 %s，请用 QQ 扫描。", qr_path.resolve())
+            # 无论是否有图形界面，都在终端渲染二维码
+            try:
+                _print_qr_terminal(png)
+                logger.info("请用 QQ 扫描上方二维码（也已保存至 %s）。", qr_path.resolve())
+            except Exception:
+                logger.info("终端渲染失败，二维码已保存至 %s，请用 QQ 扫描。", qr_path.resolve())
+            # 始终保存 PNG 以备不时之需
+            qr_path.write_bytes(png)
 
         mgr.qr_fetched.add_impl(on_qr_fetched)
 

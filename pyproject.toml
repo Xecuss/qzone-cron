@@ -8,10 +8,8 @@ dependencies = [
     "aioqzone>=1.9.0",
     "pydantic>=2.0",
     "click>=8.0",
+    "pillow>=10.0",
 ]
-
-[project.optional-dependencies]
-qr-display = ["pillow>=10.0"]
 
 [project.scripts]
 qzone-cron = "qzone_cron.__main__:cli"
