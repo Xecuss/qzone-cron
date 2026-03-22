@@ -30,6 +30,8 @@ ENABLED = True
 
 async def process(feeds: list[Any]) -> None:
     """打印每条说说的基本信息。"""
+    if not feeds:
+        return
     print(f"\n[{PLUGIN_NAME}] 收到 {len(feeds)} 条新说说：")
     print("-" * 60)
 

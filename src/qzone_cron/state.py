@@ -30,3 +30,12 @@ class State:
     @last_fetch_time.setter
     def last_fetch_time(self, value: float) -> None:
         self._data["last_fetch_time"] = value
+
+    @property
+    def last_fetched_at(self) -> float:
+        """上次实际触发抓取的墙上时间（time.time()），用于控制抓取间隔。"""
+        return float(self._data.get("last_fetched_at", 0.0))
+
+    @last_fetched_at.setter
+    def last_fetched_at(self, value: float) -> None:
+        self._data["last_fetched_at"] = value

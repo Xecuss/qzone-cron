@@ -14,6 +14,9 @@ data_dir = "~/.local/share/qzone-cron"
 max_pages = 10
 # 备用时间窗口（小时）：仅在从未运行过（无状态文件）时生效
 time_window_hours = 24.0
+# 抓取间隔（分钟）：Crontab 可高频运行（如每分钟），但实际抓取按此间隔执行。
+# 两次抓取之间的 Crontab 触发仅运行插件维护任务（如 auto_delete_plugin 的到期删除）。
+fetch_interval_minutes = 5
 
 # ─── 插件配置 ────────────────────────────────────────────────────────────────
 # 每个在 plugins/ 目录中的 .py 文件对应一个插件，文件名（不含 .py）作为配置键。

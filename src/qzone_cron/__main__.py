@@ -107,37 +107,61 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         logger.warning("未加载任何插件，退出。")
         return
 
-    logger.info(
-        "开始抓取说说（UIN: %d，上次抓取时间: %s）…",
-        config.auth.uin,
-        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.last_fetch_time))
-        if state.last_fetch_time > 0
-        else "从未",
-    )
+    plugin_context = {
+        "uin": config.auth.uin,
+        "cookie_file": config.storage.cookie_file,
+        "data_dir": config.storage.data_path,
+    }
 
-    try:
-        feeds = await fetch_feeds(
-            uin=config.auth.uin,
-            cookie_file=config.storage.cookie_file,
-            since_time=state.last_fetch_time,
-            max_pages=config.fetch.max_pages,
-        )
-    except RuntimeError as e:
-        logger.error("%s", e)
-        sys.exit(1)
+    now = time.time()
+    interval_secs = config.fetch.fetch_interval_minutes * 60
+    elapsed = now - state.last_fetched_at
+    should_fetch = elapsed >= interval_secs
 
-    if feeds:
-        # 更新上次抓取时间为最新说说的时间戳
-        newest_time = max(f.common.time for f in feeds)
-        await run_plugins(plugins, feeds)
-        state.last_fetch_time = float(newest_time)
-        state.save()
+    feeds: list = []
+
+    if should_fetch:
         logger.info(
-            "处理完成，更新上次抓取时间为 %s。",
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(newest_time)),
+            "开始抓取说说（UIN: %d，上次抓取时间: %s）…",
+            config.auth.uin,
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.last_fetch_time))
+            if state.last_fetch_time > 0
+            else "从未",
         )
+        try:
+            feeds = await fetch_feeds(
+                uin=config.auth.uin,
+                cookie_file=config.storage.cookie_file,
+                since_time=state.last_fetch_time,
+                max_pages=config.fetch.max_pages,
+            )
+        except RuntimeError as e:
+            logger.error("%s", e)
+            sys.exit(1)
+
+        state.last_fetched_at = now
+        if feeds:
+            newest_time = max(f.common.time for f in feeds)
+            state.last_fetch_time = float(newest_time)
+        state.save()
+
+        if feeds:
+            logger.info(
+                "抓取到 %d 条新说说，更新上次抓取时间为 %s。",
+                len(feeds),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.last_fetch_time)),
+            )
+        else:
+            logger.info("没有新说说。")
     else:
-        logger.info("没有新说说。")
+        remaining = int(interval_secs - elapsed)
+        logger.info(
+            "距上次抓取仅 %ds，未到抓取间隔（%dmin），跳过抓取，仅执行插件维护任务。",
+            int(elapsed),
+            config.fetch.fetch_interval_minutes,
+        )
+
+    await run_plugins(plugins, feeds, context=plugin_context)
 
 
 if __name__ == "__main__":

@@ -71,18 +71,28 @@ def load_plugins(plugins_dir: Path, plugin_configs: dict[str, Any]) -> list[Any]
     return plugins
 
 
-async def run_plugins(plugins: list[Any], feeds: list[Any]) -> None:
-    """将 feeds 列表依次传递给每个插件的 process() 函数。"""
-    import asyncio
+async def run_plugins(
+    plugins: list[Any], feeds: list[Any], context: dict[str, Any] | None = None
+) -> None:
+    """将 feeds 列表依次传递给每个插件的 process() 函数。
 
-    if not feeds:
-        logger.info("没有新说说，跳过插件处理。")
-        return
+    若插件的 process() 函数签名中包含 context 参数，则额外传入 context 字典。
+    context 包含以下键：
+        uin        - 账号 QQ 号（int）
+        cookie_file - Cookie 文件路径（Path）
+        data_dir    - 数据目录路径（Path）
+    """
+    import asyncio
+    import inspect
 
     for module in plugins:
         display_name = getattr(module, "PLUGIN_NAME", module.__name__)
         try:
-            result = module.process(feeds)
+            sig = inspect.signature(module.process)
+            if "context" in sig.parameters:
+                result = module.process(feeds, context=context)
+            else:
+                result = module.process(feeds)
             if asyncio.iscoroutine(result):
                 await result
         except Exception:

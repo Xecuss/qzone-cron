@@ -30,6 +30,8 @@ class StorageConfig(BaseModel):
 class FetchConfig(BaseModel):
     max_pages: int = 10
     time_window_hours: float = 24.0
+    fetch_interval_minutes: int = 5
+    """Crontab 每次执行时，若距上次实际抓取不足此分钟数则跳过抓取，仅执行插件维护任务。"""
 
 
 class Config(BaseModel):
