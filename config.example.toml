@@ -1,0 +1,28 @@
+# QQ 空间说说定时抓取配置示例
+# 复制此文件为 config.toml 并按需修改
+
+[auth]
+# 你的 QQ 号
+uin = 123456789
+
+[storage]
+# Cookie 和状态文件的存储目录（支持 ~ 路径）
+data_dir = "~/.local/share/qzone-cron"
+
+[fetch]
+# 每次运行最多抓取的页数（每页约 10-20 条说说）
+max_pages = 10
+# 备用时间窗口（小时）：仅在从未运行过（无状态文件）时生效
+time_window_hours = 24.0
+
+# ─── 插件配置 ────────────────────────────────────────────────────────────────
+# 每个在 plugins/ 目录中的 .py 文件对应一个插件，文件名（不含 .py）作为配置键。
+
+[plugins.print_plugin]
+# 是否启用此插件，默认 true
+enabled = true
+
+# 在此添加其他插件配置，例如：
+# [plugins.my_webhook]
+# enabled = true
+# url = "https://example.com/webhook"

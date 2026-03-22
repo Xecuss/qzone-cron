@@ -1,0 +1,32 @@
+[project]
+name = "qzone-cron"
+version = "0.1.0"
+description = "定时抓取 QQ 空间说说并通过插件处理"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aioqzone>=1.9.0",
+    "pydantic>=2.0",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+qr-display = ["pillow>=10.0"]
+
+[project.scripts]
+qzone-cron = "qzone_cron.__main__:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qzone_cron"]
+
+# aioqzone 及其依赖 pychaosvm 托管于私有索引，需额外配置
+[[tool.uv.index]]
+name = "aioqzone"
+url = "https://aioqzone.github.io/aioqzone-index/simple"
+
+[tool.uv]
+prerelease = "allow"
