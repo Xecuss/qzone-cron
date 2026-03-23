@@ -21,21 +21,45 @@ def save_cookies(cookie_file: Path, cookies: dict[str, str]) -> None:
         json.dump(cookies, f, indent=2)
 
 
+def _detect_module_count(size: int) -> int:
+    """
+    从图像边长自动探测 QR 二维码的总模块数（含安静区）。
+    QR v1-v40 含 4 模块安静区的总格数依次为 29, 33, 37, 41, ... (+4 递增)。
+    返回能整除 size 且最小的合法总格数；若无匹配则退化为 1（逐像素）。
+    """
+    for total in range(29, 200, 4):
+        if size % total == 0:
+            return total
+    return 1
+
+
 def _print_qr_terminal(png: bytes) -> None:
-    """将 QR 二维码 PNG 渲染为终端半块字符并打印到 stdout。"""
+    """
+    将 QR 二维码 PNG 渲染为终端半块字符并打印到 stdout。
+
+    终端字符格宽:高约为 1:2，利用上/下半块字符（▀ ▄ █ 空格）可将每格
+    竖切为两个近似正方形的"像素"。因此将 QR 缩放至 module_count × module_count
+    的正方形像素图，半块渲染后输出 module_count 字符宽 × module_count/2 字符高，
+    乘以字符 1:2 比例，视觉上即为正方形。
+    """
     import io as _io
 
     from PIL import Image
 
-    img = Image.open(_io.BytesIO(png)).convert("1")  # 转为 1-bit 黑白
+    img = Image.open(_io.BytesIO(png)).convert("1")
     w, h = img.size
-    # 每两行合并为一行（上半块 ▀ / 下半块 ▄ / 实心 █ / 空格）
+
+    # 缩放至正方形模块网格，每个像素对应一个 QR 模块
+    module_count = _detect_module_count(w)
+    small = img.resize((module_count, module_count), Image.NEAREST)
+    sw, sh = small.size
+
     print()
-    for y in range(0, h, 2):
+    for y in range(0, sh, 2):
         row = ""
-        for x in range(w):
-            top = img.getpixel((x, y)) == 0       # 0 = 黑色模块
-            bot = img.getpixel((x, y + 1)) == 0 if y + 1 < h else False
+        for x in range(sw):
+            top = small.getpixel((x, y)) == 0
+            bot = small.getpixel((x, y + 1)) == 0 if y + 1 < sh else False
             if top and bot:
                 row += "█"
             elif top:
