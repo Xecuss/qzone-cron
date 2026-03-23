@@ -25,7 +25,26 @@ fetch_interval_minutes = 5
 # 是否启用此插件，默认 true
 enabled = true
 
-# 在此添加其他插件配置，例如：
-# [plugins.my_webhook]
-# enabled = true
-# url = "https://example.com/webhook"
+# ─── 每日空间简报插件 ─────────────────────────────────────────────────────────
+[plugins.daily_summary_plugin]
+enabled = true
+# 每天几点生成并发送简报（0-23，本地时间）
+summary_hour = 8
+# 特别关注的 QQ 号列表（这些人的动态在简报中单独高亮展示）
+vip_uins = []
+
+[plugins.daily_summary_plugin.openai]
+# OpenAI 兼容接口的 API Key
+api_key = "sk-..."
+# 接口地址，默认为 OpenAI 官方，可替换为 Azure/Claude/本地 LLM 等兼容接口
+base_url = "https://api.openai.com/v1"
+# 使用的模型名称
+model = "gpt-4o-mini"
+# 可选：覆盖默认的系统提示词
+# system_prompt = "你是一位 QQ 空间简报助手..."
+
+[plugins.daily_summary_plugin.telegram]
+# Telegram Bot Token（通过 @BotFather 创建）
+bot_token = "123456:ABC-..."
+# 发送目标的 Chat ID（个人用户、群组或频道均可）
+chat_id = "-1001234567890"

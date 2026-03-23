@@ -111,6 +111,7 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         "uin": config.auth.uin,
         "cookie_file": config.storage.cookie_file,
         "data_dir": config.storage.data_path,
+        "plugins_config": config.plugins,
     }
 
     now = time.time()
@@ -162,6 +163,68 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         )
 
     await run_plugins(plugins, feeds, context=plugin_context)
+
+
+@cli.command("send-summary")
+@click.option(
+    "-c",
+    "--config",
+    "config_path",
+    default=str(DEFAULT_CONFIG),
+    show_default=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="配置文件路径（TOML 格式）。",
+)
+@click.option(
+    "-p",
+    "--plugins-dir",
+    "plugins_dir",
+    default=str(DEFAULT_PLUGINS_DIR),
+    show_default=True,
+    type=click.Path(path_type=Path),
+    help="插件目录路径。",
+)
+@click.option("-v", "--verbose", is_flag=True, help="输出详细日志。")
+def send_summary(config_path: Path, plugins_dir: Path, verbose: bool) -> None:  # noqa: ARG001
+    """强制立即生成并发送 daily_summary_plugin 的简报（测试用）。
+
+    忽略 summary_hour 时间限制，使用队列中已有的说说生成摘要。
+    若队列为空，可先运行 `qzone-cron run` 抓取一批说说，再执行此命令。
+    """
+    _setup_logging(verbose)
+    asyncio.run(_send_summary(config_path, plugins_dir))
+
+
+async def _send_summary(config_path: Path, plugins_dir: Path) -> None:
+    logger = logging.getLogger(__name__)
+    config = load_config(config_path)
+
+    # 找到 daily_summary_plugin 模块
+    import importlib.util
+
+    plugin_file = plugins_dir / "daily_summary_plugin.py"
+    if not plugin_file.exists():
+        logger.error("找不到 daily_summary_plugin.py（路径：%s）", plugin_file)
+        sys.exit(1)
+
+    spec = importlib.util.spec_from_file_location("daily_summary_plugin", plugin_file)
+    if spec is None or spec.loader is None:
+        logger.error("无法加载 daily_summary_plugin.py")
+        sys.exit(1)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+    if not hasattr(mod, "force_send"):
+        logger.error("daily_summary_plugin 未提供 force_send 函数")
+        sys.exit(1)
+
+    plugin_context = {
+        "uin": config.auth.uin,
+        "cookie_file": config.storage.cookie_file,
+        "data_dir": config.storage.data_path,
+        "plugins_config": config.plugins,
+    }
+    await mod.force_send(context=plugin_context)
 
 
 if __name__ == "__main__":
