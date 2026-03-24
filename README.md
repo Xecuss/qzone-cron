@@ -79,7 +79,7 @@ qzone-cron run          [-c config.toml] [-p plugins/] [-v]
 qzone-cron send-summary [-c config.toml] [-p plugins/] [-v]
 ```
 
-`send-summary` — 忽略 `summary_hour` 时间限制，立即用队列中已有的说说生成简报并发送，主要用于测试。若队列为空，可先执行一次 `qzone-cron run` 抓取说说再调用。
+`send-summary` — 忽略 `summary_times` 时间限制，立即用队列中已有的说说生成简报并发送，主要用于测试。若队列为空，可先执行一次 `qzone-cron run` 抓取说说再调用。
 
 ## 内置插件
 
@@ -104,13 +104,13 @@ enabled = false
 
 ### `daily_summary_plugin` — 每日空间简报
 
-每次 `run` 时，将好友（非自己）的最新说说追加到本地待摘要队列；每天到达 `summary_hour` 指定的小时后，调用 OpenAI 兼容接口生成中文简报，并通过 Telegram Bot 发送。
+每次 `run` 时，将好友（非自己）的最新说说追加到本地待摘要队列；每当 cron 运行越过 `summary_times` 中配置的某个时间点后，调用 OpenAI 兼容接口生成中文简报，并通过 Telegram Bot 发送。
 
 **主要特性：**
 
 - 每条说说记录文字内容、媒体类型（图片/视频）、点赞/评论数及前几条评论
 - 转发说说同时附上原文作者和内容
-- 通过 `vip_uins` 配置特别关注名单，对应用户的动态在简报中单独分组高亮
+- 通过 `summary_times` 配置多个每日推送时间点，采用“越过时间点触发”机制，即使 cron 频率浮动也不会漏推
 - 简报以 HTML 格式发送，支持超长内容自动分段（Telegram 单条 4096 字限制）
 - 发送成功后才清空队列，发送失败则保留数据供下次重试
 
@@ -119,8 +119,8 @@ enabled = false
 ```toml
 [plugins.daily_summary_plugin]
 enabled = true
-summary_hour = 8          # 每天几点发送摘要（0-23，本地时间）
-vip_uins = [12345678]     # 特别关注的 QQ 号列表
+summary_times = ["08:00", "20:00"]  # 每天推送时间点，可配置多个
+vip_uins = [12345678]               # 特别关注的 QQ 号列表
 
 [plugins.daily_summary_plugin.openai]
 api_key = "sk-..."

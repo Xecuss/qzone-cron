@@ -28,8 +28,8 @@ enabled = true
 # ─── 每日空间简报插件 ─────────────────────────────────────────────────────────
 [plugins.daily_summary_plugin]
 enabled = true
-# 每天几点生成并发送简报（0-23，本地时间）
-summary_hour = 8
+# 每天推送简报的时间点列表（本地时间，HH:MM 格式，可配置多个）
+summary_times = ["08:00"]
 # 特别关注的 QQ 号列表（这些人的动态在简报中单独高亮展示）
 vip_uins = []
 

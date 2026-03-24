@@ -1,15 +1,20 @@
 """
-daily_summary_plugin — 每日空间简报插件
+daily_summary_plugin — 空间简报插件
 
-汇总好友说说（不含自己发布的），每天在指定时间通过 OpenAI 兼容接口生成摘要，
-并通过 Telegram Bot 发送每日简报。
+汇总好友说说（不含自己发布的），在每个配置的时间点通过 OpenAI 兼容接口生成摘要，
+并通过 Telegram Bot 发送简报。
+
+时间触发机制：
+    每次 cron 运行时记录本次检测时间。若上一次检测时间早于某个推送时间点，
+    而本次检测时间晚于该时间点，则说明刚刚越过了这个时间点，立即触发推送。
+    发送失败时不更新检测时间，下次运行会自动重试。
 
 配置示例 (config.toml):
 
     [plugins.daily_summary_plugin]
     enabled = true
-    summary_hour = 8          # 每天几点发送摘要（0-23，本地时间）
-    vip_uins = [12345678]     # 特别关注的 QQ 号列表（摘要中优先展示）
+    summary_times = ["08:00", "20:00"]  # 每天推送时间点列表（本地时间，HH:MM）
+    vip_uins = [12345678]               # 特别关注的 QQ 号列表（摘要中优先展示）
 
     [plugins.daily_summary_plugin.openai]
     api_key = "sk-..."
@@ -54,15 +59,19 @@ _DEFAULT_SYSTEM_PROMPT = (
 
 def _load_state(state_file: Path) -> dict:
     if not state_file.exists():
-        return {"last_summary_date": "", "pending_feeds": []}
+        return {"last_check_time": None, "pending_feeds": []}
     try:
         with open(state_file, encoding="utf-8") as f:
             data = json.load(f)
-        data.setdefault("last_summary_date", "")
+        # 兼容旧版本状态（last_summary_date → last_check_time）
+        if "last_summary_date" in data and "last_check_time" not in data:
+            data["last_check_time"] = None
+            del data["last_summary_date"]
+        data.setdefault("last_check_time", None)
         data.setdefault("pending_feeds", [])
         return data
     except Exception:
-        return {"last_summary_date": "", "pending_feeds": []}
+        return {"last_check_time": None, "pending_feeds": []}
 
 
 def _save_state(state_file: Path, state: dict) -> None:
@@ -205,6 +214,37 @@ def _build_prompt(pending_feeds: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ─── Time trigger ────────────────────────────────────────────────────────────
+
+
+def _check_trigger(state: dict, summary_times: list[str], now: datetime) -> bool:
+    """检查自上次运行以来是否越过了某个推送时间点。
+
+    算法：若 last_check_time < trigger_dt <= now，则判定刚刚越过该时间点，返回 True。
+    首次运行（last_check_time 为 None）时不触发，只记录基准时间。
+    """
+    last_check_str: str | None = state.get("last_check_time")
+    if not last_check_str:
+        return False
+    try:
+        last_check_dt = datetime.fromisoformat(last_check_str)
+    except ValueError:
+        return False
+
+    for time_str in summary_times:
+        try:
+            hour, minute = map(int, time_str.split(":"))
+        except (ValueError, AttributeError):
+            logger.warning("无效的推送时间格式：%s，已跳过。", time_str)
+            continue
+        trigger_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if last_check_dt < trigger_dt <= now:
+            logger.info("已越过推送时间点 %s，触发简报生成。", time_str)
+            return True
+
+    return False
+
+
 # ─── OpenAI compatible API call ───────────────────────────────────────────────
 
 
@@ -275,78 +315,79 @@ async def _do_send(
     openai_cfg: dict,
     telegram_cfg: dict,
     vip_uins: set[int],
-    summary_hour: int,
+    summary_times: list[str],
     *,
     force: bool = False,
 ) -> None:
-    """生成摘要并发送到 Telegram，成功后清空队列。
+    """生成摘要并发送到 Telegram，成功后清空队列并更新 last_check_time。
 
     force=True 时跳过时间检查（用于测试）。
+    发送失败时不更新 last_check_time，下次运行会自动重试。
     """
     now = datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
 
     if not force:
-        should_send = (
-            now.hour >= summary_hour and state["last_summary_date"] != today_str
-        )
-        if not should_send:
+        triggered = _check_trigger(state, summary_times, now)
+        if not triggered:
+            state["last_check_time"] = now.isoformat()
             _save_state(state_file, state)
             return
 
     if not state["pending_feeds"]:
         logger.info("待摘要队列为空，%s摘要生成。", "强制跳过" if force else "跳过")
         if not force:
-            state["last_summary_date"] = today_str
+            state["last_check_time"] = now.isoformat()
         _save_state(state_file, state)
         return
 
     pending = state["pending_feeds"]
-    logger.info("开始生成每日空间简报，共 %d 条动态…", len(pending))
+    logger.info("开始生成空间简报，共 %d 条动态…", len(pending))
     user_prompt = _build_prompt(pending)
 
     try:
         summary = await _call_openai(openai_cfg, user_prompt)
     except Exception as e:
-        logger.error("调用 OpenAI API 失败：%s", e)
+        logger.error("调用 OpenAI API 失败：%s，队列保留，下次推送时间点自动重试。", e)
+        # 不更新 last_check_time，下次运行仍会触发
         _save_state(state_file, state)
         return
 
-    date_str = now.strftime("%Y年%m月%d日")
+    date_str = now.strftime("%Y年%m月%d日 %H:%M")
     vip_note = ""
     if vip_uins:
         vip_names = "、".join(str(u) for u in sorted(vip_uins))
         vip_note = f"\n<i>特别关注：{vip_names}</i>"
 
     message = (
-        f"<b>📰 {html.escape(date_str)} QQ 空间每日简报</b>{vip_note}\n\n"
+        f"<b>📰 {html.escape(date_str)} QQ 空间简报</b>{vip_note}\n\n"
         f"{html.escape(summary)}"
     )
 
     try:
         await _send_telegram(telegram_cfg, message)
-        logger.info("每日空间简报已成功发送到 Telegram。")
+        logger.info("空间简报已成功发送到 Telegram。")
     except Exception as e:
-        logger.error("发送 Telegram 消息失败：%s", e)
+        logger.error("发送 Telegram 消息失败：%s，队列保留，下次推送时间点自动重试。", e)
+        # 不更新 last_check_time，下次运行仍会触发
         _save_state(state_file, state)
         return
 
     state["pending_feeds"] = []
-    state["last_summary_date"] = today_str
-    logger.info("待摘要队列已清空，下次将从明日 %02d:00 后生成。", summary_hour)
+    state["last_check_time"] = now.isoformat()
+    logger.info("待摘要队列已清空。")
     _save_state(state_file, state)
 
 
-def _resolve_context(context: dict) -> tuple[dict, int | None, Path | None, dict, dict, int, set[int]]:
+def _resolve_context(context: dict) -> tuple[dict, int | None, Path | None, dict, dict, list[str], set[int]]:
     plugins_config: dict = context.get("plugins_config", {})
     cfg: dict = plugins_config.get("daily_summary_plugin", {})
     owner_uin: int | None = context.get("uin")
     data_dir: Path | None = context.get("data_dir")
     openai_cfg: dict = cfg.get("openai", {})
     telegram_cfg: dict = cfg.get("telegram", {})
-    summary_hour: int = int(cfg.get("summary_hour", 8))
+    summary_times: list[str] = cfg.get("summary_times", ["08:00"])
     vip_uins: set[int] = set(cfg.get("vip_uins", []))
-    return cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_hour, vip_uins
+    return cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_times, vip_uins
 
 
 def _check_required(openai_cfg: dict, telegram_cfg: dict) -> bool:
@@ -366,7 +407,7 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
     if context is None:
         return
 
-    cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_hour, vip_uins = (
+    cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_times, vip_uins = (
         _resolve_context(context)
     )
     if not owner_uin:
@@ -403,7 +444,7 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
 
     # ── 步骤 2：按时间决定是否发送 ───────────────────────────────────────────
     await _do_send(
-        state, state_file, openai_cfg, telegram_cfg, vip_uins, summary_hour
+        state, state_file, openai_cfg, telegram_cfg, vip_uins, summary_times
     )
 
 
@@ -420,7 +461,7 @@ async def force_send(context: dict | None = None) -> None:
         logger.error("force_send: context 为 None，无法执行。")
         return
 
-    cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_hour, vip_uins = (
+    cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_times, vip_uins = (
         _resolve_context(context)
     )
     if not owner_uin:
@@ -440,5 +481,5 @@ async def force_send(context: dict | None = None) -> None:
         "force_send: 队列中有 %d 条动态，立即生成简报…", len(state["pending_feeds"])
     )
     await _do_send(
-        state, state_file, openai_cfg, telegram_cfg, vip_uins, summary_hour, force=True
+        state, state_file, openai_cfg, telegram_cfg, vip_uins, summary_times, force=True
     )
