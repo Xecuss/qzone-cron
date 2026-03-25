@@ -51,7 +51,7 @@ def _print_qr_terminal(png: bytes) -> None:
 
     # 缩放至正方形模块网格，每个像素对应一个 QR 模块
     module_count = _detect_module_count(w)
-    small = img.resize((module_count, module_count), Image.NEAREST)
+    small = img.resize((module_count, module_count), Image.Resampling.NEAREST)
     sw, sh = small.size
 
     print()
@@ -136,7 +136,18 @@ async def fetch_feeds(
         attach_info: str | None = None
 
         for page in range(max_pages):
-            resp = await api.get_active_feeds(attach_info=attach_info)
+            try:
+                resp = await api.get_active_feeds(attach_info=attach_info)
+            except Exception as e:
+                # tenacity.RetryError 包裹真正的异常，需要解包
+                from tenacity import RetryError
+                cause = e.last_attempt.exception() if isinstance(e, RetryError) else e
+                from aioqzone.exception import QzoneError
+                if isinstance(cause, QzoneError) and cause.code == -3000:
+                    raise RuntimeError(
+                        f"QQ空间返回「系统繁忙」（code=-3000），Cookie 已失效，需要重新登录。"
+                    ) from e
+                raise
 
             for feed in resp.vFeeds:
                 feed_time: int = feed.common.time

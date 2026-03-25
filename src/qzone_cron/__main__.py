@@ -291,11 +291,13 @@ async def _send_summary(config_path: Path, plugins_dir: Path) -> None:
         logger.error("daily_summary_plugin 未提供 force_send 函数")
         sys.exit(1)
 
+    send_notice = make_send_notice(config.telegram)
     plugin_context = {
         "uin": config.auth.uin,
         "cookie_file": config.storage.cookie_file,
         "data_dir": config.storage.data_path,
         "plugins_config": config.plugins,
+        "send_notice": send_notice,
     }
     await mod.force_send(context=plugin_context)
 
