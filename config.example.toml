@@ -4,6 +4,9 @@
 [auth]
 # 你的 QQ 号
 uin = 123456789
+# 检测到登录失效时，自动发起重新登录并将二维码发送至 Telegram（需配置 [telegram]）
+# 启用后，crontab 再次触发时若 setup 进程仍在等待扫码，会自动跳过避免重复发送
+auto_relogin = false
 
 [storage]
 # Cookie 和状态文件的存储目录（支持 ~ 路径）

@@ -54,6 +54,8 @@ uv run qzone-cron setup
 
 扫描终端或弹出窗口中的二维码，完成登录。Cookie 将自动保存至 `~/.local/share/qzone-cron/cookies.json`。
 
+若已配置全局 `[telegram]`，二维码图片也会同时发送到 Telegram，方便远程扫码。
+
 ### 4. 手动运行一次
 
 ```bash
@@ -194,9 +196,30 @@ enabled = false
 
 ## Cookie 过期处理
 
-当 Cookie 过期时，`run` 命令会报错退出。重新执行 `setup` 命令扫码登录即可。
+当 Cookie 过期时，`run` 命令会检测到登录失效。有两种处理方式：
 
-若已配置全局 `[telegram]`，登录失效时主流程会自动通过 Telegram 发送提醒消息。
+**方式一：手动重新登录**
+
+```bash
+uv run qzone-cron setup
+```
+
+**方式二：`auto_relogin` 自动重登（推荐配合 crontab 使用）**
+
+在 `config.toml` 中开启：
+
+```toml
+[auth]
+uin = 123456789
+auto_relogin = true
+```
+
+开启后，当 `run` 检测到登录失效时，会自动进入登录流程并将二维码发送至 Telegram（需配置 `[telegram]`）。
+二维码过期刷新时，Telegram 中的图片会**原地更新**，不会产生新消息。
+
+**防止 crontab 重复触发：** 自动登录期间会在数据目录写入 `setup.lock` 锁文件（记录进程 PID）。
+crontab 下次触发时若检测到该进程仍在运行（等待扫码），会静默退出，不会重新发送二维码。
+扫码成功或登录超时后，锁文件自动删除，后续 cron 恢复正常抓取。
 
 > **提示**：`aioqzone` 文档建议每 5 分钟调用一次 `mfeeds_get_count` 可保持 Cookie 活跃。`run` 命令通过 `get_active_feeds` 访问 API，同样有保活效果。
 

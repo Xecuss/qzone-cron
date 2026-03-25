@@ -72,10 +72,12 @@ def _print_qr_terminal(png: bytes) -> None:
     print()
 
 
-async def setup_login(uin: int, cookie_file: Path) -> None:
-    """交互式二维码登录，将 cookie 保存至文件。"""
-    import asyncio
+async def setup_login(uin: int, cookie_file: Path, qr_sender=None) -> None:
+    """交互式二维码登录，将 cookie 保存至文件。
 
+    qr_sender: 可选的二维码回调（如 QrSender 实例），接收 PNG bytes 并负责发送/更新；
+               为 None 时仅在终端渲染。
+    """
     from aioqzone.api.login import QrLoginManager
     from aioqzone.model.protocol.config import QrLoginConfig
     from qqqr.utils.net import ClientAdapter
@@ -96,6 +98,9 @@ async def setup_login(uin: int, cookie_file: Path) -> None:
                 logger.info("终端渲染失败，二维码已保存至 %s，请用 QQ 扫描。", qr_path.resolve())
             # 始终保存 PNG 以备不时之需
             qr_path.write_bytes(png)
+            # 通过 Telegram 发送/更新（若已配置）
+            if qr_sender is not None:
+                await qr_sender(png)
 
         mgr.qr_fetched.add_impl(on_qr_fetched)
 

@@ -1,12 +1,15 @@
 """notifier — 全局通知工具。
 
-目前支持通过 Telegram Bot 发送消息。
-提供 make_send_notice() 工厂函数，根据全局 TelegramConfig 返回一个绑定好配置的
-async send_notice(text) 协程函数，供主流程和各插件通过 context["send_notice"] 使用。
+目前支持通过 Telegram Bot 发送消息和二维码图片。
+提供两个工厂函数：
+  make_send_notice(cfg) — 返回 async send_notice(text) 文字通知函数
+  make_qr_sender(cfg)   — 返回 QrSender 实例，用于登录二维码的发送与原地更新
 
 用法（主流程）:
-    from .notifier import make_send_notice
+    from .notifier import make_send_notice, make_qr_sender
     context["send_notice"] = make_send_notice(config.telegram)
+    qr_sender = make_qr_sender(config.telegram)
+    await setup_login(uin, cookie_file, qr_sender=qr_sender)
 
 用法（插件内）:
     send_notice = context.get("send_notice")
@@ -70,3 +73,83 @@ def make_send_notice(cfg: "TelegramConfig") -> SendNotice | None:
             logger.error("发送 Telegram 通知失败：%s", e)
 
     return send_notice
+
+
+# ─── QR code sender ───────────────────────────────────────────────────────────
+
+
+async def _send_photo_telegram(
+    bot_token: str, chat_id: str, png: bytes, caption: str = ""
+) -> int:
+    """发送图片消息，返回 message_id。"""
+    import httpx
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            url,
+            data={"chat_id": chat_id, "caption": caption},
+            files={"photo": ("qrcode.png", png, "image/png")},
+        )
+        resp.raise_for_status()
+        return int(resp.json()["result"]["message_id"])
+
+
+async def _edit_photo_telegram(
+    bot_token: str, chat_id: str, message_id: int, png: bytes
+) -> None:
+    """使用 editMessageMedia 原地替换已有消息的图片。"""
+    import json as _json
+
+    import httpx
+
+    url = f"https://api.telegram.org/bot{bot_token}/editMessageMedia"
+    media = _json.dumps({"type": "photo", "media": "attach://photo"})
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            url,
+            data={"chat_id": chat_id, "message_id": str(message_id), "media": media},
+            files={"photo": ("qrcode.png", png, "image/png")},
+        )
+        resp.raise_for_status()
+
+
+class QrSender:
+    """有状态的 Telegram 二维码发送器。
+
+    首次调用 sendPhoto 发送新消息并记录 message_id；
+    后续调用 editMessageMedia 原地更新同一条消息，避免刷新时刷屏。
+    """
+
+    def __init__(self, bot_token: str, chat_id: str) -> None:
+        self._bot_token = bot_token
+        self._chat_id = chat_id
+        self._message_id: int | None = None
+
+    async def __call__(self, png: bytes) -> None:
+        try:
+            if self._message_id is None:
+                self._message_id = await _send_photo_telegram(
+                    self._bot_token,
+                    self._chat_id,
+                    png,
+                    caption="📱 请扫描二维码登录 QQ 空间（二维码过期时会自动刷新）",
+                )
+                logger.info("QQ 登录二维码已发送至 Telegram（message_id=%d）。", self._message_id)
+            else:
+                await _edit_photo_telegram(
+                    self._bot_token, self._chat_id, self._message_id, png
+                )
+                logger.info("Telegram 中的登录二维码已更新。")
+        except Exception as e:
+            logger.error("Telegram 二维码发送/更新失败：%s", e)
+
+
+def make_qr_sender(cfg: "TelegramConfig") -> QrSender | None:
+    """根据全局 TelegramConfig 返回 QrSender 实例。
+
+    若 Telegram 未配置，返回 None（二维码仅在终端显示）。
+    """
+    if not cfg.enabled:
+        return None
+    return QrSender(cfg.bot_token, cfg.chat_id)

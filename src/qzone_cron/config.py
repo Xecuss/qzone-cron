@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 
 class AuthConfig(BaseModel):
     uin: int
+    auto_relogin: bool = False
+    """检测到登录失效时自动触发重新登录流程，并将二维码发送至 Telegram（需配置 [telegram]）。"""
 
 
 class StorageConfig(BaseModel):

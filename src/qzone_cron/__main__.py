@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -10,7 +11,7 @@ import click
 
 from .config import load_config
 from .fetcher import fetch_feeds, setup_login
-from .notifier import make_send_notice
+from .notifier import make_qr_sender, make_send_notice
 from .plugin_loader import load_plugins, run_plugins
 from .state import State
 
@@ -52,14 +53,19 @@ def setup(config_path: Path, verbose: bool) -> None:
     首次使用或 Cookie 过期后执行此命令。
     """
     _setup_logging(verbose)
-    logger = logging.getLogger(__name__)
+    asyncio.run(_setup(config_path))
 
+
+async def _setup(config_path: Path) -> None:
+    logger = logging.getLogger(__name__)
     config = load_config(config_path)
-    cookie_file = config.storage.cookie_file
+    qr_sender = make_qr_sender(config.telegram)
 
     logger.info("开始 QQ 空间登录流程（UIN: %d）…", config.auth.uin)
+    if qr_sender:
+        logger.info("登录二维码将通过 Telegram 发送。")
     try:
-        asyncio.run(setup_login(config.auth.uin, cookie_file))
+        await setup_login(config.auth.uin, config.storage.cookie_file, qr_sender=qr_sender)
     except Exception as e:
         logger.error("登录失败：%s", e)
         sys.exit(1)
@@ -95,6 +101,32 @@ def run(config_path: Path, plugins_dir: Path, verbose: bool) -> None:
     """
     _setup_logging(verbose)
     asyncio.run(_run(config_path, plugins_dir))
+
+
+def _is_setup_in_progress(lock_file: Path) -> bool:
+    """检查锁文件中记录的 setup 进程是否仍在运行。"""
+    if not lock_file.exists():
+        return False
+    try:
+        pid = int(lock_file.read_text().strip())
+        os.kill(pid, 0)  # 信号 0 仅检查进程是否存在，不实际发送信号
+        return True
+    except (ValueError, OSError):
+        lock_file.unlink(missing_ok=True)  # 进程已结束，清理过期锁
+        return False
+
+
+def _acquire_setup_lock(lock_file: Path) -> bool:
+    """尝试获取 setup 锁，成功返回 True，已有进程在运行则返回 False。"""
+    if _is_setup_in_progress(lock_file):
+        return False
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.write_text(str(os.getpid()))
+    return True
+
+
+def _release_setup_lock(lock_file: Path) -> None:
+    lock_file.unlink(missing_ok=True)
 
 
 async def _run(config_path: Path, plugins_dir: Path) -> None:
@@ -142,14 +174,44 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
             )
         except RuntimeError as e:
             logger.error("%s", e)
-            if send_notice:
-                import html as _html
-                await send_notice(
-                    f"\u26a0\ufe0f <b>qzone-cron \u767b\u5f55\u5931\u6548</b>\n"
-                    f"{_html.escape(str(e))}\n\n"
-                    "\u8bf7\u8fd0\u884c <code>qzone-cron setup</code> \u91cd\u65b0\u626b\u7801\u767b\u5f55\u3002"
-                )
-            sys.exit(1)
+            if config.auth.auto_relogin:
+                lock_file = config.storage.data_path / "setup.lock"
+                if not _acquire_setup_lock(lock_file):
+                    pid = lock_file.read_text().strip() if lock_file.exists() else "?"
+                    logger.info(
+                        "登录失效，setup 进程（PID %s）已在运行，等待扫码中，本次跳过。", pid
+                    )
+                    return
+                logger.info("登录失效，自动触发重新登录（二维码将发送至 Telegram）…")
+                try:
+                    qr_sender = make_qr_sender(config.telegram)
+                    await setup_login(
+                        config.auth.uin,
+                        config.storage.cookie_file,
+                        qr_sender=qr_sender,
+                    )
+                    logger.info("自动重新登录成功，下次 cron 将恢复正常抓取。")
+                except Exception as setup_err:
+                    logger.error("自动重新登录失败：%s", setup_err)
+                    if send_notice:
+                        import html as _html
+                        await send_notice(
+                            f"\u26a0\ufe0f <b>qzone-cron 自动重新登录失败</b>\n"
+                            f"{_html.escape(str(setup_err))}\n\n"
+                            "请手动运行 <code>qzone-cron setup</code>。"
+                        )
+                finally:
+                    _release_setup_lock(lock_file)
+                return
+            else:
+                if send_notice:
+                    import html as _html
+                    await send_notice(
+                        f"\u26a0\ufe0f <b>qzone-cron 登录失效</b>\n"
+                        f"{_html.escape(str(e))}\n\n"
+                        "请运行 <code>qzone-cron setup</code> 重新扫码登录。"
+                    )
+                sys.exit(1)
 
         state.last_fetched_at = now
         if feeds:
