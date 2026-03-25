@@ -2,7 +2,7 @@
 daily_summary_plugin — 空间简报插件
 
 汇总好友说说（不含自己发布的），在每个配置的时间点通过 OpenAI 兼容接口生成摘要，
-并通过 Telegram Bot 发送简报。
+并通过全局 send_notice（Telegram）发送简报。
 
 时间触发机制：
     每次 cron 运行时记录本次检测时间。若上一次检测时间早于某个推送时间点，
@@ -10,6 +10,10 @@ daily_summary_plugin — 空间简报插件
     发送失败时不更新检测时间，下次运行会自动重试。
 
 配置示例 (config.toml):
+
+    [telegram]
+    bot_token = "123456:ABC-..."
+    chat_id = "-1001234567890"
 
     [plugins.daily_summary_plugin]
     enabled = true
@@ -21,10 +25,6 @@ daily_summary_plugin — 空间简报插件
     base_url = "https://api.openai.com/v1"  # 兼容各类 OpenAI 接口
     model = "gpt-4o-mini"
     # system_prompt = "..."   # 可选，覆盖默认系统提示词
-
-    [plugins.daily_summary_plugin.telegram]
-    bot_token = "123456:ABC-..."
-    chat_id = "-1001234567890"
 """
 from __future__ import annotations
 
@@ -277,35 +277,6 @@ async def _call_openai(cfg: dict, user_prompt: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-# ─── Telegram ────────────────────────────────────────────────────────────────
-
-
-async def _send_telegram(cfg: dict, text: str) -> None:
-    import httpx
-
-    bot_token: str = cfg.get("bot_token", "")
-    chat_id: str = str(cfg.get("chat_id", ""))
-
-    if not bot_token or not chat_id:
-        logger.warning("Telegram 配置不完整（bot_token 或 chat_id 缺失），跳过发送。")
-        return
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    # Telegram 单条消息最长 4096 字符
-    _MAX = 4096
-    chunks = [text[i : i + _MAX] for i in range(0, len(text), _MAX)]
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for chunk in chunks:
-            payload = {
-                "chat_id": chat_id,
-                "text": chunk,
-                "parse_mode": "HTML",
-            }
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-
-
 # ─── Shared send logic ────────────────────────────────────────────────────────
 
 
@@ -313,13 +284,13 @@ async def _do_send(
     state: dict,
     state_file: Path,
     openai_cfg: dict,
-    telegram_cfg: dict,
     vip_uins: set[int],
     summary_times: list[str],
+    send_notice: Any,
     *,
     force: bool = False,
 ) -> None:
-    """生成摘要并发送到 Telegram，成功后清空队列并更新 last_check_time。
+    """生成摘要并通过全局 send_notice 发送，成功后清空队列并更新 last_check_time。
 
     force=True 时跳过时间检查（用于测试）。
     发送失败时不更新 last_check_time，下次运行会自动重试。
@@ -364,7 +335,7 @@ async def _do_send(
     )
 
     try:
-        await _send_telegram(telegram_cfg, message)
+        await send_notice(message)
         logger.info("空间简报已成功发送到 Telegram。")
     except Exception as e:
         logger.error("发送 Telegram 消息失败：%s，队列保留，下次推送时间点自动重试。", e)
@@ -378,24 +349,23 @@ async def _do_send(
     _save_state(state_file, state)
 
 
-def _resolve_context(context: dict) -> tuple[dict, int | None, Path | None, dict, dict, list[str], set[int]]:
+def _resolve_context(context: dict) -> tuple[dict, int | None, Path | None, dict, list[str], set[int]]:
     plugins_config: dict = context.get("plugins_config", {})
     cfg: dict = plugins_config.get("daily_summary_plugin", {})
     owner_uin: int | None = context.get("uin")
     data_dir: Path | None = context.get("data_dir")
     openai_cfg: dict = cfg.get("openai", {})
-    telegram_cfg: dict = cfg.get("telegram", {})
     summary_times: list[str] = cfg.get("summary_times", ["08:00"])
     vip_uins: set[int] = set(cfg.get("vip_uins", []))
-    return cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_times, vip_uins
+    return cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins
 
 
-def _check_required(openai_cfg: dict, telegram_cfg: dict) -> bool:
+def _check_required(openai_cfg: dict, send_notice: Any) -> bool:
     if not openai_cfg.get("api_key"):
         logger.warning("daily_summary_plugin: 未配置 openai.api_key，跳过。")
         return False
-    if not telegram_cfg.get("bot_token") or not telegram_cfg.get("chat_id"):
-        logger.warning("daily_summary_plugin: 未配置 telegram.bot_token 或 chat_id，跳过。")
+    if send_notice is None:
+        logger.warning("daily_summary_plugin: 未配置全局 [telegram]，无法发送简报，跳过。")
         return False
     return True
 
@@ -407,12 +377,13 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
     if context is None:
         return
 
-    cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_times, vip_uins = (
+    send_notice = context.get("send_notice")
+    cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins = (
         _resolve_context(context)
     )
     if not owner_uin:
         return
-    if not _check_required(openai_cfg, telegram_cfg):
+    if not _check_required(openai_cfg, send_notice):
         return
 
     state_file = (
@@ -443,9 +414,7 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
         )
 
     # ── 步骤 2：按时间决定是否发送 ───────────────────────────────────────────
-    await _do_send(
-        state, state_file, openai_cfg, telegram_cfg, vip_uins, summary_times
-    )
+    await _do_send(state, state_file, openai_cfg, vip_uins, summary_times, send_notice)
 
 
 # ─── Force send (for testing) ─────────────────────────────────────────────────
@@ -461,13 +430,14 @@ async def force_send(context: dict | None = None) -> None:
         logger.error("force_send: context 为 None，无法执行。")
         return
 
-    cfg, owner_uin, data_dir, openai_cfg, telegram_cfg, summary_times, vip_uins = (
+    send_notice = context.get("send_notice")
+    cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins = (
         _resolve_context(context)
     )
     if not owner_uin:
         logger.error("force_send: 未提供 owner_uin。")
         return
-    if not _check_required(openai_cfg, telegram_cfg):
+    if not _check_required(openai_cfg, send_notice):
         return
 
     state_file = (
@@ -480,6 +450,4 @@ async def force_send(context: dict | None = None) -> None:
     logger.info(
         "force_send: 队列中有 %d 条动态，立即生成简报…", len(state["pending_feeds"])
     )
-    await _do_send(
-        state, state_file, openai_cfg, telegram_cfg, vip_uins, summary_times, force=True
-    )
+    await _do_send(state, state_file, openai_cfg, vip_uins, summary_times, send_notice, force=True)

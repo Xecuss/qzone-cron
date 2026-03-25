@@ -18,6 +18,14 @@ time_window_hours = 24.0
 # 两次抓取之间的 Crontab 触发仅运行插件维护任务（如 auto_delete_plugin 的到期删除）。
 fetch_interval_minutes = 5
 
+# ─── 全局 Telegram 通知 ───────────────────────────────────────────────────────
+# 配置后，主流程（如检测到登录失效）和各插件均可通过全局 send_notice 发送通知。
+[telegram]
+# Telegram Bot Token（通过 @BotFather 创建）
+bot_token = "123456:ABC-..."
+# 发送目标的 Chat ID（个人用户、群组或频道均可）
+chat_id = "-1001234567890"
+
 # ─── 插件配置 ────────────────────────────────────────────────────────────────
 # 每个在 plugins/ 目录中的 .py 文件对应一个插件，文件名（不含 .py）作为配置键。
 
@@ -42,9 +50,3 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 # 可选：覆盖默认的系统提示词
 # system_prompt = "你是一位 QQ 空间简报助手..."
-
-[plugins.daily_summary_plugin.telegram]
-# Telegram Bot Token（通过 @BotFather 创建）
-bot_token = "123456:ABC-..."
-# 发送目标的 Chat ID（个人用户、群组或频道均可）
-chat_id = "-1001234567890"

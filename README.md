@@ -15,6 +15,7 @@ qzone-cron/
 │       ├── __main__.py     # CLI 入口（setup / run / send-summary 命令）
 │       ├── config.py       # 配置加载（TOML + Pydantic）
 │       ├── fetcher.py      # QQ 空间说说抓取
+│       ├── notifier.py     # 全局通知（Telegram send_notice）
 │       ├── plugin_loader.py # 插件加载与分发
 │       └── state.py        # 运行状态持久化
 └── plugins/
@@ -117,6 +118,11 @@ enabled = false
 **配置示例（`config.toml`）：**
 
 ```toml
+# 全局 Telegram 配置（主流程和所有插件共用）
+[telegram]
+bot_token = "123456:ABC-..."
+chat_id = "-1001234567890"
+
 [plugins.daily_summary_plugin]
 enabled = true
 summary_times = ["08:00", "20:00"]  # 每天推送时间点，可配置多个
@@ -127,10 +133,6 @@ api_key = "sk-..."
 base_url = "https://api.openai.com/v1"  # 可替换为任意 OpenAI 兼容接口
 model = "gpt-4o-mini"
 # system_prompt = "..."   # 可选，覆盖内置系统提示词
-
-[plugins.daily_summary_plugin.telegram]
-bot_token = "123456:ABC-..."
-chat_id = "-1001234567890"
 ```
 
 **测试简报发送：**
@@ -157,10 +159,12 @@ async def process(feeds: list, context: dict | None = None) -> None:
     """
     feeds:   本次新抓取到的说说列表（aioqzone FeedData 对象）
     context: 运行上下文，包含以下键：
-               uin           — 账号 QQ 号
-               cookie_file   — Cookie 文件路径
-               data_dir      — 数据目录（Path）
+               uin            — 账号 QQ 号
+               cookie_file    — Cookie 文件路径
+               data_dir       — 数据目录（Path）
                plugins_config — 插件配置字典
+               send_notice    — 全局 Telegram 通知函数（async (str) -> None）
+                                未配置全局 [telegram] 时为 None
 
     常用 feed 字段：
       feed.userinfo.uin         — 发布者 QQ 号
@@ -174,8 +178,11 @@ async def process(feeds: list, context: dict | None = None) -> None:
       feed.comment.comments     — 评论列表（可能为 None）
       feed.original             — 转发原文（可能为 None）
     """
+    send_notice = context.get("send_notice") if context else None
     for feed in feeds:
         print(feed.summary.summary)
+        if send_notice:
+            await send_notice(f"新说说：{feed.summary.summary}")
 ```
 
 插件也可在 `config.toml` 中通过 `enabled = false` 禁用：
@@ -188,6 +195,8 @@ enabled = false
 ## Cookie 过期处理
 
 当 Cookie 过期时，`run` 命令会报错退出。重新执行 `setup` 命令扫码登录即可。
+
+若已配置全局 `[telegram]`，登录失效时主流程会自动通过 Telegram 发送提醒消息。
 
 > **提示**：`aioqzone` 文档建议每 5 分钟调用一次 `mfeeds_get_count` 可保持 Cookie 活跃。`run` 命令通过 `get_active_feeds` 访问 API，同样有保活效果。
 

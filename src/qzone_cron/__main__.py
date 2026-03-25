@@ -10,6 +10,7 @@ import click
 
 from .config import load_config
 from .fetcher import fetch_feeds, setup_login
+from .notifier import make_send_notice
 from .plugin_loader import load_plugins, run_plugins
 from .state import State
 
@@ -107,11 +108,14 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         logger.warning("未加载任何插件，退出。")
         return
 
+    send_notice = make_send_notice(config.telegram)
+
     plugin_context = {
         "uin": config.auth.uin,
         "cookie_file": config.storage.cookie_file,
         "data_dir": config.storage.data_path,
         "plugins_config": config.plugins,
+        "send_notice": send_notice,
     }
 
     now = time.time()
@@ -138,6 +142,13 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
             )
         except RuntimeError as e:
             logger.error("%s", e)
+            if send_notice:
+                import html as _html
+                await send_notice(
+                    f"\u26a0\ufe0f <b>qzone-cron \u767b\u5f55\u5931\u6548</b>\n"
+                    f"{_html.escape(str(e))}\n\n"
+                    "\u8bf7\u8fd0\u884c <code>qzone-cron setup</code> \u91cd\u65b0\u626b\u7801\u767b\u5f55\u3002"
+                )
             sys.exit(1)
 
         state.last_fetched_at = now

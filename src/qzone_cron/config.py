@@ -34,10 +34,20 @@ class FetchConfig(BaseModel):
     """Crontab 每次执行时，若距上次实际抓取不足此分钟数则跳过抓取，仅执行插件维护任务。"""
 
 
+class TelegramConfig(BaseModel):
+    bot_token: str = ""
+    chat_id: str = ""
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.bot_token and self.chat_id)
+
+
 class Config(BaseModel):
     auth: AuthConfig
     storage: StorageConfig = Field(default_factory=StorageConfig)
     fetch: FetchConfig = Field(default_factory=FetchConfig)
+    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     plugins: dict[str, Any] = Field(default_factory=dict)
 
 
