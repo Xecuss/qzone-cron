@@ -167,6 +167,15 @@ async def _feed_to_record(feed: Any, vip_uins: set[int], openai_cfg: dict) -> di
         if image_urls:
             image_description = await _describe_images(openai_cfg, image_urls, content)
 
+    # 分享信息（链接/音乐等分享卡片）
+    share_title: str = ""
+    share_summary: str = ""
+    if feed.operation and feed.operation.share_info:
+        _s = feed.operation.share_info.summary or ""
+        if "来自QQ空间" not in _s:
+            share_title = feed.operation.share_info.title or ""
+            share_summary = _s
+
     # 转发原文
     original: dict | None = None
     if feed.original is not None:
@@ -217,6 +226,8 @@ async def _feed_to_record(feed: Any, vip_uins: set[int], openai_cfg: dict) -> di
         "top_comments": top_comments,
         "original": original,
         "image_description": image_description,
+        "share_title": share_title,
+        "share_summary": share_summary,
     }
 
 
@@ -236,7 +247,22 @@ def _build_prompt(pending_feeds: list[dict], now: datetime) -> str:
     for item in sorted(pending_feeds, key=lambda x: x["time"]):
         ts = datetime.fromtimestamp(item["time"]).strftime("%H:%M")
         vip_tag = "【特别关注】" if item.get("is_vip") else ""
-        content = item["content"].strip() or "（无文字内容）"
+        content = item["content"].strip()
+
+        # 分享卡片信息
+        share_str = ""
+        share_title = item.get("share_title", "").strip()
+        share_summary_text = item.get("share_summary", "").strip()
+        if share_title or share_summary_text:
+            share_parts = []
+            if share_title:
+                share_parts.append(share_title)
+            if share_summary_text:
+                share_parts.append(share_summary_text)
+            share_str = f"\n    🔗 分享：{' — '.join(share_parts)}"
+
+        if not content:
+            content = "（无文字内容）"
 
         # 媒体标注
         media_parts: list[str] = []
@@ -297,6 +323,7 @@ def _build_prompt(pending_feeds: list[dict], now: datetime) -> str:
             f"- {ts} {vip_tag}{item['nickname']}({item['uin']}): "
             f"{content}{media_str}{interaction_str}"
             f"{image_desc_str}"
+            f"{share_str}"
             f"{forward_str}{comments_str}"
         )
     return "\n".join(lines)
