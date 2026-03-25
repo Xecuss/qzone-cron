@@ -42,10 +42,10 @@ logger = logging.getLogger(PLUGIN_NAME)
 
 _DEFAULT_SYSTEM_PROMPT = (
     "你是一位 QQ 空间简报助手。"
-    "你将收到用户好友今日在 QQ 空间发布的说说原始数据，请生成一份简洁易读的每日简报。\n\n"
+    "你将收到用户好友近期在 QQ 空间发布的说说原始数据，请生成一份简洁易读的空间简报。\n\n"
     "要求：\n"
     "1. 用中文撰写，风格轻松活泼；\n"
-    "2. 开头用 1-2 句话概括今日动态整体氛围；\n"
+    "2. 开头用 1-2 句话概括本期动态整体氛围；\n"
     "3. 若数据中有【特别关注】标记的好友动态，在简报中单独分组并重点介绍；"
     "若无【特别关注】条目则不要提及该分组，不得自行脑补；\n"
     "4. 对其余好友动态进行整体归纳，选取有趣或有代表性的内容介绍，无需逐条列举；\n"
@@ -83,7 +83,57 @@ def _save_state(state_file: Path, state: dict) -> None:
 # ─── Feed ingestion ───────────────────────────────────────────────────────────
 
 
-def _feed_to_record(feed: Any, vip_uins: set[int]) -> dict:
+async def _describe_images(
+    openai_cfg: dict, image_urls: list[str], context_text: str
+) -> str | None:
+    """调用视觉模型对图片内容进行预描述，失败时静默返回 None。
+
+    可通过 openai.describe_images = false 关闭；
+    可通过 openai.vision_model 指定不同于摘要生成的模型。
+    """
+    if not image_urls or not openai_cfg.get("api_key"):
+        return None
+    if not openai_cfg.get("describe_images", True):
+        return None
+
+    import httpx
+
+    api_key: str = openai_cfg.get("api_key", "")
+    base_url: str = openai_cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    model: str = openai_cfg.get("vision_model") or openai_cfg.get("model", "gpt-4o-mini")
+
+    prompt_text = "请用1-2句话简洁描述这些图片的内容"
+    if context_text.strip():
+        prompt_text += f"，可结合说说文字「{context_text.strip()}」理解语境"
+    prompt_text += "。"
+
+    content_parts: list[dict] = [{"type": "text", "text": prompt_text}]
+    for url in image_urls[:4]:  # 最多处理 4 张，避免 token 消耗过大
+        content_parts.append({"type": "image_url", "image_url": {"url": url}})
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": content_parts}],
+        "max_tokens": 150,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{base_url}/chat/completions", headers=headers, json=payload
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.warning("图片描述生成失败（%s），将仅记录「含图片」。", e)
+        return None
+
+
+async def _feed_to_record(feed: Any, vip_uins: set[int], openai_cfg: dict) -> dict:
     uin: int = feed.userinfo.uin
     nickname: str = feed.userinfo.nickname or str(uin)
     post_time: int = int(feed.common.time)
@@ -105,6 +155,18 @@ def _feed_to_record(feed: Any, vip_uins: set[int]) -> dict:
                 "content": c.content,
             })
 
+    # 图片预描述：入队时即调用视觉模型，避免总结阶段只有「含图片」标注
+    image_description: str | None = None
+    if has_images:
+        image_urls: list[str] = []
+        for pic in feed.pic.picdata:
+            try:
+                image_urls.append(str(pic.photourl.largest.url))
+            except Exception:
+                pass
+        if image_urls:
+            image_description = await _describe_images(openai_cfg, image_urls, content)
+
     # 转发原文
     original: dict | None = None
     if feed.original is not None:
@@ -113,15 +175,29 @@ def _feed_to_record(feed: Any, vip_uins: set[int]) -> dict:
             orig_content = (
                 feed.original.summary.summary if feed.original.summary else ""
             ) or ""
+            orig_has_images = bool(
+                feed.original.pic and getattr(feed.original.pic, "picdata", None)
+            )
+            orig_image_description: str | None = None
+            if orig_has_images and feed.original.pic:
+                orig_urls: list[str] = []
+                for pic in feed.original.pic.picdata:
+                    try:
+                        orig_urls.append(str(pic.photourl.largest.url))
+                    except Exception:
+                        pass
+                if orig_urls:
+                    orig_image_description = await _describe_images(
+                        openai_cfg, orig_urls, orig_content
+                    )
             original = {
                 "deleted": False,
                 "uin": feed.original.userinfo.uin,
                 "nickname": feed.original.userinfo.nickname or str(feed.original.userinfo.uin),
                 "content": orig_content,
-                "has_images": bool(
-                    feed.original.pic and getattr(feed.original.pic, "picdata", None)
-                ),
+                "has_images": orig_has_images,
                 "has_video": bool(feed.original.video),
+                "image_description": orig_image_description,
             }
         else:
             # Share 对象：原文已删除或无法获取
@@ -140,18 +216,20 @@ def _feed_to_record(feed: Any, vip_uins: set[int]) -> dict:
         "comment_count": comment_count,
         "top_comments": top_comments,
         "original": original,
+        "image_description": image_description,
     }
 
 
 # ─── Prompt building ──────────────────────────────────────────────────────────
 
 
-def _build_prompt(pending_feeds: list[dict]) -> str:
+def _build_prompt(pending_feeds: list[dict], now: datetime) -> str:
     if not pending_feeds:
-        return "今天没有好友发布任何说说。"
+        return "当前没有好友发布任何说说。"
 
+    now_str = now.strftime("%Y年%m月%d日 %H:%M")
     has_vip = any(item.get("is_vip") for item in pending_feeds)
-    lines: list[str] = ["以下是今日好友的 QQ 空间动态（按时间顺序排列）：\n"]
+    lines: list[str] = [f"当前时间：{now_str}\n", "以下是本期收集到的好友 QQ 空间动态（按时间顺序排列）：\n"]
     if has_vip:
         lines.append("（其中标有【特别关注】的条目请在简报中重点介绍）\n")
 
@@ -162,11 +240,16 @@ def _build_prompt(pending_feeds: list[dict]) -> str:
 
         # 媒体标注
         media_parts: list[str] = []
-        if item.get("has_images"):
+        if item.get("has_images") and not item.get("image_description"):
             media_parts.append("含图片")
         if item.get("has_video"):
             media_parts.append("含视频")
         media_str = f" [{','.join(media_parts)}]" if media_parts else ""
+
+        # 图片描述（有描述时替代「含图片」标注）
+        image_desc_str = ""
+        if item.get("image_description"):
+            image_desc_str = f"\n    📷 {item['image_description']}"
 
         # 互动数据
         like_count = item.get("like_count", 0)
@@ -187,14 +270,18 @@ def _build_prompt(pending_feeds: list[dict]) -> str:
             else:
                 orig_content = original.get("content", "").strip() or "（无文字内容）"
                 orig_media: list[str] = []
-                if original.get("has_images"):
+                if original.get("has_images") and not original.get("image_description"):
                     orig_media.append("含图片")
                 if original.get("has_video"):
                     orig_media.append("含视频")
                 orig_media_str = f" [{','.join(orig_media)}]" if orig_media else ""
+                orig_image_desc_str = ""
+                if original.get("image_description"):
+                    orig_image_desc_str = f"\n        📷 {original['image_description']}"
                 forward_str = (
                     f"\n    └ 转发自 {original['nickname']}({original['uin']}): "
                     f"{orig_content}{orig_media_str}"
+                    f"{orig_image_desc_str}"
                 )
 
         # 代表性评论（最多2条）
@@ -209,6 +296,7 @@ def _build_prompt(pending_feeds: list[dict]) -> str:
         lines.append(
             f"- {ts} {vip_tag}{item['nickname']}({item['uin']}): "
             f"{content}{media_str}{interaction_str}"
+            f"{image_desc_str}"
             f"{forward_str}{comments_str}"
         )
     return "\n".join(lines)
@@ -313,7 +401,7 @@ async def _do_send(
 
     pending = state["pending_feeds"]
     logger.info("开始生成空间简报，共 %d 条动态…", len(pending))
-    user_prompt = _build_prompt(pending)
+    user_prompt = _build_prompt(pending, now)
 
     try:
         summary = await _call_openai(openai_cfg, user_prompt)
@@ -399,7 +487,7 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
     for feed in feeds:
         if feed.userinfo.uin == owner_uin:
             continue
-        record = _feed_to_record(feed, vip_uins)
+        record = await _feed_to_record(feed, vip_uins, openai_cfg)
         if record["fid"] in existing_fids:
             continue
         state["pending_feeds"].append(record)

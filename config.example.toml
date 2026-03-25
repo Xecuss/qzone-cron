@@ -49,7 +49,11 @@ vip_uins = []
 api_key = "sk-..."
 # 接口地址，默认为 OpenAI 官方，可替换为 Azure/Claude/本地 LLM 等兼容接口
 base_url = "https://api.openai.com/v1"
-# 使用的模型名称
+# 使用的模型名称（用于生成简报）
 model = "gpt-4o-mini"
+# 图片预描述：说说入队时自动调用视觉模型描述图片内容，让简报更真实（默认开启）
+# describe_images = true
+# 可选：单独指定视觉模型；不填则复用 model 字段的模型
+# vision_model = "gpt-4o-mini"
 # 可选：覆盖默认的系统提示词
 # system_prompt = "你是一位 QQ 空间简报助手..."
