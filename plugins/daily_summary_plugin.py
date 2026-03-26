@@ -59,7 +59,7 @@ _DEFAULT_SYSTEM_PROMPT = (
 
 def _load_state(state_file: Path) -> dict:
     if not state_file.exists():
-        return {"last_check_time": None, "pending_feeds": []}
+        return {"last_check_time": None, "pending_feed_ids": [], "image_desc_cache": {}}
     try:
         with open(state_file, encoding="utf-8") as f:
             data = json.load(f)
@@ -68,10 +68,33 @@ def _load_state(state_file: Path) -> dict:
             data["last_check_time"] = None
             del data["last_summary_date"]
         data.setdefault("last_check_time", None)
-        data.setdefault("pending_feeds", [])
+        # 迁移旧版 pending_feeds 格式 → pending_feed_ids + image_desc_cache
+        if "pending_feeds" in data and "pending_feed_ids" not in data:
+            old_feeds = data.pop("pending_feeds", [])
+            data["pending_feed_ids"] = [f["fid"] for f in old_feeds if "fid" in f]
+            cache: dict = {}
+            legacy: dict = {}
+            for f in old_feeds:
+                if "fid" not in f:
+                    continue
+                fid = f["fid"]
+                if f.get("image_description"):
+                    cache[fid] = f["image_description"]
+                orig = f.get("original")
+                if orig and not orig.get("deleted") and orig.get("image_description"):
+                    cache[f"{fid}:orig"] = orig["image_description"]
+                legacy[fid] = f
+            data["image_desc_cache"] = cache
+            data["_legacy_feed_data"] = legacy
+            logger.info(
+                "已迁移旧版 pending_feeds 至新格式，%d 条待处理动态。",
+                len(data["pending_feed_ids"]),
+            )
+        data.setdefault("pending_feed_ids", [])
+        data.setdefault("image_desc_cache", {})
         return data
     except Exception:
-        return {"last_check_time": None, "pending_feeds": []}
+        return {"last_check_time": None, "pending_feed_ids": [], "image_desc_cache": {}}
 
 
 def _save_state(state_file: Path, state: dict) -> None:
@@ -133,62 +156,38 @@ async def _describe_images(
         return None
 
 
-async def _feed_to_record(feed: Any, vip_uins: set[int], openai_cfg: dict) -> dict:
-    uin: int = feed.userinfo.uin
-    nickname: str = feed.userinfo.nickname or str(uin)
-    post_time: int = int(feed.common.time)
-    content: str = (feed.summary.summary if feed.summary else "") or ""
-    has_images = bool(feed.pic and getattr(feed.pic, "picdata", None))
-    has_video = bool(feed.video)
-    fid: str = getattr(feed, "fid", f"{uin}_{post_time}")
+async def _compute_image_descs(
+    fid: str, feed: Any, openai_cfg: dict, cache: dict
+) -> None:
+    """计算 feed（及其转发原文）的图片描述并写入 cache，已缓存则跳过。"""
+    # 主帖图片
+    if fid not in cache:
+        has_images = bool(feed.pic and getattr(feed.pic, "picdata", None))
+        if has_images:
+            content = (feed.summary.summary if feed.summary else "") or ""
+            image_urls: list[str] = []
+            for pic in feed.pic.picdata:
+                try:
+                    image_urls.append(str(pic.photourl.largest.url))
+                except Exception:
+                    pass
+            if image_urls:
+                desc = await _describe_images(openai_cfg, image_urls, content)
+                if desc:
+                    cache[fid] = desc
 
-    # 点赞数 / 评论数
-    like_count: int = feed.like.likeNum if feed.like else 0
-    comment_count: int = feed.comment.num if feed.comment else 0
-
-    # 前几条评论内容（最多取3条）
-    top_comments: list[dict] = []
-    if feed.comment and feed.comment.comments:
-        for c in feed.comment.comments[:3]:
-            top_comments.append({
-                "user": c.user.nickname or str(c.user.uin),
-                "content": c.content,
-            })
-
-    # 图片预描述：入队时即调用视觉模型，避免总结阶段只有「含图片」标注
-    image_description: str | None = None
-    if has_images:
-        image_urls: list[str] = []
-        for pic in feed.pic.picdata:
-            try:
-                image_urls.append(str(pic.photourl.largest.url))
-            except Exception:
-                pass
-        if image_urls:
-            image_description = await _describe_images(openai_cfg, image_urls, content)
-
-    # 分享信息（链接/音乐等分享卡片）
-    share_title: str = ""
-    share_summary: str = ""
-    if feed.operation and feed.operation.share_info:
-        _s = feed.operation.share_info.summary or ""
-        if "来自QQ空间" not in _s:
-            share_title = feed.operation.share_info.title or ""
-            share_summary = _s
-
-    # 转发原文
-    original: dict | None = None
-    if feed.original is not None:
+    # 转发原文图片
+    orig_key = f"{fid}:orig"
+    if orig_key not in cache and feed.original is not None:
         from aioqzone.model.api.feed import FeedOriginal
         if isinstance(feed.original, FeedOriginal):
-            orig_content = (
-                feed.original.summary.summary if feed.original.summary else ""
-            ) or ""
             orig_has_images = bool(
                 feed.original.pic and getattr(feed.original.pic, "picdata", None)
             )
-            orig_image_description: str | None = None
-            if orig_has_images and feed.original.pic:
+            if orig_has_images:
+                orig_content = (
+                    feed.original.summary.summary if feed.original.summary else ""
+                ) or ""
                 orig_urls: list[str] = []
                 for pic in feed.original.pic.picdata:
                     try:
@@ -196,39 +195,23 @@ async def _feed_to_record(feed: Any, vip_uins: set[int], openai_cfg: dict) -> di
                     except Exception:
                         pass
                 if orig_urls:
-                    orig_image_description = await _describe_images(
-                        openai_cfg, orig_urls, orig_content
-                    )
-            original = {
-                "deleted": False,
-                "uin": feed.original.userinfo.uin,
-                "nickname": feed.original.userinfo.nickname or str(feed.original.userinfo.uin),
-                "content": orig_content,
-                "has_images": orig_has_images,
-                "has_video": bool(feed.original.video),
-                "image_description": orig_image_description,
-            }
-        else:
-            # Share 对象：原文已删除或无法获取
-            original = {"deleted": True}
+                    desc = await _describe_images(openai_cfg, orig_urls, orig_content)
+                    if desc:
+                        cache[orig_key] = desc
 
-    return {
-        "fid": fid,
-        "uin": uin,
-        "nickname": nickname,
-        "time": post_time,
-        "content": content,
-        "has_images": has_images,
-        "has_video": has_video,
-        "is_vip": uin in vip_uins,
-        "like_count": like_count,
-        "comment_count": comment_count,
-        "top_comments": top_comments,
-        "original": original,
-        "image_description": image_description,
-        "share_title": share_title,
-        "share_summary": share_summary,
-    }
+
+def _build_record_from_store(
+    fid: str, feed_data: dict, image_desc_cache: dict, vip_uins: set[int]
+) -> dict:
+    """从 feed_store 数据 + image_desc_cache 构建供 _build_prompt 使用的 record。"""
+    record = dict(feed_data)
+    record["is_vip"] = feed_data["uin"] in vip_uins
+    record["image_description"] = image_desc_cache.get(fid)
+    if record.get("original") and not record["original"].get("deleted"):
+        orig = dict(record["original"])
+        orig["image_description"] = image_desc_cache.get(f"{fid}:orig")
+        record["original"] = orig
+    return record
 
 
 # ─── Prompt building ──────────────────────────────────────────────────────────
@@ -398,6 +381,7 @@ async def _call_openai(cfg: dict, user_prompt: str) -> str:
 async def _do_send(
     state: dict,
     state_file: Path,
+    feed_store: dict,
     openai_cfg: dict,
     vip_uins: set[int],
     summary_times: list[str],
@@ -419,16 +403,38 @@ async def _do_send(
             _save_state(state_file, state)
             return
 
-    if not state["pending_feeds"]:
+    pending_ids: list[str] = state["pending_feed_ids"]
+    if not pending_ids:
         logger.info("待摘要队列为空，%s摘要生成。", "强制跳过" if force else "跳过")
         if not force:
             state["last_check_time"] = now.isoformat()
         _save_state(state_file, state)
         return
 
-    pending = state["pending_feeds"]
-    logger.info("开始生成空间简报，共 %d 条动态…", len(pending))
-    user_prompt = _build_prompt(pending, now)
+    image_desc_cache: dict = state["image_desc_cache"]
+    legacy: dict = state.get("_legacy_feed_data", {})
+
+    # 从 feed_store 中获取完整 feed 数据（迁移期间允许回退到 legacy）
+    pending_records: list[dict] = []
+    missing = 0
+    for fid in pending_ids:
+        feed_data = feed_store.get(fid) or legacy.get(fid)
+        if not feed_data:
+            missing += 1
+            continue
+        pending_records.append(_build_record_from_store(fid, feed_data, image_desc_cache, vip_uins))
+    if missing:
+        logger.warning("有 %d 条动态 fid 在 feed_store 中未找到，已跳过。", missing)
+
+    if not pending_records:
+        logger.info("所有队列条目均无法解析，%s摘要生成。", "强制跳过" if force else "跳过")
+        if not force:
+            state["last_check_time"] = now.isoformat()
+        _save_state(state_file, state)
+        return
+
+    logger.info("开始生成空间简报，共 %d 条动态…", len(pending_records))
+    user_prompt = _build_prompt(pending_records, now)
 
     try:
         summary = await _call_openai(openai_cfg, user_prompt)
@@ -458,7 +464,12 @@ async def _do_send(
         _save_state(state_file, state)
         return
 
-    state["pending_feeds"] = []
+    # 清空队列，清理本期 image_desc_cache，移除迁移遗留数据
+    for fid in pending_ids:
+        image_desc_cache.pop(fid, None)
+        image_desc_cache.pop(f"{fid}:orig", None)
+    state["pending_feed_ids"] = []
+    state.pop("_legacy_feed_data", None)
     state["last_check_time"] = now.isoformat()
     logger.info("待摘要队列已清空。")
     _save_state(state_file, state)
@@ -488,7 +499,11 @@ def _check_required(openai_cfg: dict, send_notice: Any) -> bool:
 # ─── Main process ─────────────────────────────────────────────────────────────
 
 
-async def process(feeds: list[Any], context: dict | None = None) -> None:
+async def process(
+    feeds: list[Any],
+    updated_feeds: list[dict] | None = None,
+    context: dict | None = None,
+) -> None:
     if context is None:
         return
 
@@ -507,29 +522,40 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
         else Path("data/daily_summary_state.json")
     )
     state = _load_state(state_file)
+    feed_store: dict = context.get("feed_store", {})
 
-    # ── 步骤 1：将新抓取的非自己说说写入待摘要队列 ────────────────────────────
-    existing_fids: set[str] = {item["fid"] for item in state["pending_feeds"]}
+    # ── 步骤 1：将新抓取的非自己说说的 fid 写入待摘要队列 ────────────────────
+    existing_fids: set[str] = set(state["pending_feed_ids"])
     added = 0
     for feed in feeds:
         if feed.userinfo.uin == owner_uin:
             continue
-        record = await _feed_to_record(feed, vip_uins, openai_cfg)
-        if record["fid"] in existing_fids:
+        fid: str = getattr(feed, "fid", f"{feed.userinfo.uin}_{feed.common.time}")
+        if fid in existing_fids:
             continue
-        state["pending_feeds"].append(record)
-        existing_fids.add(record["fid"])
+        # 趁有原始对象时计算图片描述（已缓存则自动跳过）
+        await _compute_image_descs(fid, feed, openai_cfg, state["image_desc_cache"])
+        state["pending_feed_ids"].append(fid)
+        existing_fids.add(fid)
         added += 1
 
     if added:
         logger.info(
             "已记录 %d 条新动态，待摘要队列共 %d 条。",
             added,
-            len(state["pending_feeds"]),
+            len(state["pending_feed_ids"]),
+        )
+
+    if updated_feeds:
+        logger.info(
+            "收到 %d 条 stats 更新动态（将在生成简报时使用最新数据）。",
+            len(updated_feeds),
         )
 
     # ── 步骤 2：按时间决定是否发送 ───────────────────────────────────────────
-    await _do_send(state, state_file, openai_cfg, vip_uins, summary_times, send_notice)
+    await _do_send(
+        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice
+    )
 
 
 # ─── Force send (for testing) ─────────────────────────────────────────────────
@@ -561,8 +587,11 @@ async def force_send(context: dict | None = None) -> None:
         else Path("data/daily_summary_state.json")
     )
     state = _load_state(state_file)
+    feed_store: dict = context.get("feed_store", {})
 
     logger.info(
-        "force_send: 队列中有 %d 条动态，立即生成简报…", len(state["pending_feeds"])
+        "force_send: 队列中有 %d 条动态，立即生成简报…", len(state["pending_feed_ids"])
     )
-    await _do_send(state, state_file, openai_cfg, vip_uins, summary_times, send_notice, force=True)
+    await _do_send(
+        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice, force=True
+    )

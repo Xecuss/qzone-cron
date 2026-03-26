@@ -8,6 +8,86 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def feed_to_dict(feed: Any) -> dict:
+    """将 aioqzone feed 对象序列化为可 JSON 存储的字典（不含 AI 生成内容）。"""
+    uin: int = feed.userinfo.uin
+    nickname: str = feed.userinfo.nickname or str(uin)
+    post_time: int = int(feed.common.time)
+    content: str = (feed.summary.summary if feed.summary else "") or ""
+    fid: str = getattr(feed, "fid", f"{uin}_{post_time}")
+
+    like_count: int = feed.like.likeNum if feed.like else 0
+    comment_count: int = feed.comment.num if feed.comment else 0
+
+    top_comments: list[dict] = []
+    if feed.comment and feed.comment.comments:
+        for c in feed.comment.comments[:3]:
+            top_comments.append({
+                "user": c.user.nickname or str(c.user.uin),
+                "content": c.content,
+            })
+
+    has_images = bool(feed.pic and getattr(feed.pic, "picdata", None))
+    has_video = bool(feed.video)
+    image_urls: list[str] = []
+    if has_images:
+        for pic in feed.pic.picdata:
+            try:
+                image_urls.append(str(pic.photourl.largest.url))
+            except Exception:
+                pass
+
+    share_title: str = ""
+    share_summary: str = ""
+    if feed.operation and feed.operation.share_info:
+        _s = feed.operation.share_info.summary or ""
+        if "来自QQ空间" not in _s:
+            share_title = feed.operation.share_info.title or ""
+            share_summary = _s
+
+    original: dict | None = None
+    if feed.original is not None:
+        from aioqzone.model.api.feed import FeedOriginal
+        if isinstance(feed.original, FeedOriginal):
+            orig_content = (feed.original.summary.summary if feed.original.summary else "") or ""
+            orig_has_images = bool(feed.original.pic and getattr(feed.original.pic, "picdata", None))
+            orig_image_urls: list[str] = []
+            if orig_has_images and feed.original.pic:
+                for pic in feed.original.pic.picdata:
+                    try:
+                        orig_image_urls.append(str(pic.photourl.largest.url))
+                    except Exception:
+                        pass
+            original = {
+                "deleted": False,
+                "uin": feed.original.userinfo.uin,
+                "nickname": feed.original.userinfo.nickname or str(feed.original.userinfo.uin),
+                "content": orig_content,
+                "has_images": orig_has_images,
+                "has_video": bool(feed.original.video),
+                "image_urls": orig_image_urls,
+            }
+        else:
+            original = {"deleted": True}
+
+    return {
+        "fid": fid,
+        "uin": uin,
+        "nickname": nickname,
+        "time": post_time,
+        "content": content,
+        "has_images": has_images,
+        "has_video": has_video,
+        "image_urls": image_urls,
+        "like_count": like_count,
+        "comment_count": comment_count,
+        "top_comments": top_comments,
+        "original": original,
+        "share_title": share_title,
+        "share_summary": share_summary,
+    }
+
+
 def load_cookies(cookie_file: Path) -> dict[str, str] | None:
     if not cookie_file.exists():
         return None

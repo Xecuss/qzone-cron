@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import time as _time
 from pathlib import Path
 from typing import Any
 
 
 class State:
-    """持久化运行状态（上次抓取时间）。"""
+    """持久化运行状态（上次抓取时间、feed 详情缓存等）。"""
 
     def __init__(self, state_file: Path) -> None:
         self._file = state_file
@@ -39,3 +40,26 @@ class State:
     @last_fetched_at.setter
     def last_fetched_at(self, value: float) -> None:
         self._data["last_fetched_at"] = value
+
+    @property
+    def last_full_refresh_at(self) -> float:
+        """上次全量 stats 刷新的墙上时间。"""
+        return float(self._data.get("last_full_refresh_at", 0.0))
+
+    @last_full_refresh_at.setter
+    def last_full_refresh_at(self, value: float) -> None:
+        self._data["last_full_refresh_at"] = value
+
+    @property
+    def feed_store(self) -> dict[str, Any]:
+        """feed 详情存储：fid → 序列化的 feed 字典（不含 AI 生成内容）。"""
+        return self._data.setdefault("feed_store", {})
+
+    def expire_feeds(self, retention_hours: float) -> int:
+        """清除早于 retention_hours 的 feed，返回被清除的条数。"""
+        cutoff = _time.time() - retention_hours * 3600
+        store = self.feed_store
+        to_remove = [fid for fid, f in store.items() if f.get("time", 0) < cutoff]
+        for fid in to_remove:
+            del store[fid]
+        return len(to_remove)

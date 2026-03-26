@@ -72,15 +72,20 @@ def load_plugins(plugins_dir: Path, plugin_configs: dict[str, Any]) -> list[Any]
 
 
 async def run_plugins(
-    plugins: list[Any], feeds: list[Any], context: dict[str, Any] | None = None
+    plugins: list[Any],
+    feeds: list[Any],
+    updated_feeds: list[Any] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> None:
     """将 feeds 列表依次传递给每个插件的 process() 函数。
 
-    若插件的 process() 函数签名中包含 context 参数，则额外传入 context 字典。
+    若插件的 process() 签名中包含 context 参数，则额外传入 context 字典。
+    若插件的 process() 签名中包含 updated_feeds 参数，则额外传入 stats 有变化的 feed 字典列表。
     context 包含以下键：
         uin        - 账号 QQ 号（int）
         cookie_file - Cookie 文件路径（Path）
         data_dir    - 数据目录路径（Path）
+        feed_store  - 主循环维护的 feed 详情字典（dict[fid, dict]）
     """
     import asyncio
     import inspect
@@ -89,10 +94,12 @@ async def run_plugins(
         display_name = getattr(module, "PLUGIN_NAME", module.__name__)
         try:
             sig = inspect.signature(module.process)
+            kwargs: dict = {}
             if "context" in sig.parameters:
-                result = module.process(feeds, context=context)
-            else:
-                result = module.process(feeds)
+                kwargs["context"] = context
+            if "updated_feeds" in sig.parameters:
+                kwargs["updated_feeds"] = updated_feeds or []
+            result = module.process(feeds, **kwargs)
             if asyncio.iscoroutine(result):
                 await result
         except Exception:

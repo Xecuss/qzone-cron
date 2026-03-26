@@ -10,7 +10,7 @@ from pathlib import Path
 import click
 
 from .config import load_config
-from .fetcher import fetch_feeds, setup_login
+from .fetcher import feed_to_dict, fetch_feeds, setup_login
 from .notifier import make_qr_sender, make_send_notice
 from .plugin_loader import load_plugins, run_plugins
 from .state import State
@@ -148,6 +148,7 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         "data_dir": config.storage.data_path,
         "plugins_config": config.plugins,
         "send_notice": send_notice,
+        "feed_store": state.feed_store,  # 与 state.feed_store 同一对象引用，后续更新自动可见
     }
 
     now = time.time()
@@ -217,6 +218,10 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         if feeds:
             newest_time = max(f.common.time for f in feeds)
             state.last_fetch_time = float(newest_time)
+        for feed in feeds:
+            fid = getattr(feed, "fid", None)
+            if fid:
+                state.feed_store[fid] = feed_to_dict(feed)
         state.save()
 
         if feeds:
@@ -235,7 +240,48 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
             config.fetch.fetch_interval_minutes,
         )
 
-    await run_plugins(plugins, feeds, context=plugin_context)
+    # ── 全量 stats 刷新 ──────────────────────────────────────────────────────
+    updated_feeds: list[dict] = []
+    refresh_interval_secs = config.fetch.stats_refresh_interval_minutes * 60
+    if now - state.last_full_refresh_at >= refresh_interval_secs:
+        since_full = now - config.fetch.stats_refresh_window_hours * 3600
+        logger.info(
+            "开始全量 stats 刷新（过去 %.1f 小时）…",
+            config.fetch.stats_refresh_window_hours,
+        )
+        try:
+            refresh_raw = await fetch_feeds(
+                uin=config.auth.uin,
+                cookie_file=config.storage.cookie_file,
+                since_time=since_full,
+                max_pages=config.fetch.max_pages,
+            )
+            store = state.feed_store
+            for feed in refresh_raw:
+                fid = getattr(feed, "fid", None)
+                if not fid or fid not in store:
+                    continue
+                refreshed = feed_to_dict(feed)
+                old = store[fid]
+                if (
+                    refreshed["like_count"] != old.get("like_count")
+                    or refreshed["comment_count"] != old.get("comment_count")
+                ):
+                    updated_feeds.append(refreshed)
+                store[fid] = refreshed
+            state.last_full_refresh_at = now
+            expired = state.expire_feeds(config.fetch.feed_retention_hours)
+            if expired:
+                logger.info("已清理 %d 条过期 feed。", expired)
+            logger.info(
+                "全量 stats 刷新完成，%d 条 feed 有数据更新。", len(updated_feeds)
+            )
+        except Exception as e:
+            logger.warning("全量 stats 刷新失败：%s，跳过。", e)
+            state.last_full_refresh_at = now  # 避免失败后每次 cron 都重试
+        state.save()
+
+    await run_plugins(plugins, feeds, updated_feeds=updated_feeds, context=plugin_context)
 
 
 @cli.command("send-summary")
@@ -292,12 +338,14 @@ async def _send_summary(config_path: Path, plugins_dir: Path) -> None:
         sys.exit(1)
 
     send_notice = make_send_notice(config.telegram)
+    state = State(config.storage.state_file)
     plugin_context = {
         "uin": config.auth.uin,
         "cookie_file": config.storage.cookie_file,
         "data_dir": config.storage.data_path,
         "plugins_config": config.plugins,
         "send_notice": send_notice,
+        "feed_store": state.feed_store,
     }
     await mod.force_send(context=plugin_context)
 

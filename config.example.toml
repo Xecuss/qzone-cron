@@ -20,6 +20,13 @@ time_window_hours = 24.0
 # 抓取间隔（分钟）：Crontab 可高频运行（如每分钟），但实际抓取按此间隔执行。
 # 两次抓取之间的 Crontab 触发仅运行插件维护任务（如 auto_delete_plugin 的到期删除）。
 fetch_interval_minutes = 5
+# 全量 stats 刷新间隔（分钟）：每隔此时间重新拉取近期说说以更新点赞/评论数。
+stats_refresh_interval_minutes = 60
+# 全量 stats 刷新的时间窗口（小时）：每次刷新向前覆盖多长时间范围。
+stats_refresh_window_hours = 6.0
+# feed 详情在主循环中的保留时长（小时），必须 >= stats_refresh_window_hours。
+# 插件可按 fid 从 feed_store 中查询到此范围内的任意说说数据。
+feed_retention_hours = 48.0
 
 # ─── 全局 Telegram 通知 ───────────────────────────────────────────────────────
 # 配置后，主流程（如检测到登录失效）和各插件均可通过全局 send_notice 发送通知。
