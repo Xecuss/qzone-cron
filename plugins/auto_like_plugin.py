@@ -159,7 +159,11 @@ async def _should_like_feeds(feeds: list[Any], openai_cfg: dict) -> set[str]:
 
         raw = data["choices"][0]["message"]["content"]
         logger.debug("[LLM 输出] %s", raw)
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.warning("LLM 返回内容无法解析为 JSON（%s），原始内容：%s", e, raw)
+            return set()
 
         # 兼容返回格式：{"fids": [...]} 或其他常见键名
         if isinstance(parsed, list):
