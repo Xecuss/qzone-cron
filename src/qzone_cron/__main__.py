@@ -153,133 +153,154 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
 
     now = time.time()
     interval_secs = config.fetch.fetch_interval_minutes * 60
+    refresh_interval_secs = config.fetch.stats_refresh_interval_minutes * 60
     elapsed = now - state.last_fetched_at
+
     should_fetch = elapsed >= interval_secs
+    do_full_refresh = now - state.last_full_refresh_at >= refresh_interval_secs
 
     feeds: list = []
+    updated_feeds: list[dict] = []
 
-    if should_fetch:
-        logger.info(
-            "开始抓取说说（UIN: %d，上次抓取时间: %s）…",
-            config.auth.uin,
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.last_fetch_time))
-            if state.last_fetch_time > 0
-            else "从未",
-        )
-        try:
-            feeds = await fetch_feeds(
-                uin=config.auth.uin,
-                cookie_file=config.storage.cookie_file,
-                since_time=state.last_fetch_time,
-                max_pages=config.fetch.max_pages,
-            )
-        except RuntimeError as e:
-            logger.error("%s", e)
-            if config.auth.auto_relogin:
-                lock_file = config.storage.data_path / "setup.lock"
-                if not _acquire_setup_lock(lock_file):
-                    pid = lock_file.read_text().strip() if lock_file.exists() else "?"
-                    logger.info(
-                        "登录失效，setup 进程（PID %s）已在运行，等待扫码中，本次跳过。", pid
-                    )
-                    return
-                logger.info("登录失效，自动触发重新登录（二维码将发送至 Telegram）…")
-                try:
-                    qr_sender = make_qr_sender(config.telegram)
-                    await setup_login(
-                        config.auth.uin,
-                        config.storage.cookie_file,
-                        qr_sender=qr_sender,
-                    )
-                    logger.info("自动重新登录成功，下次 cron 将恢复正常抓取。")
-                except Exception as setup_err:
-                    logger.error("自动重新登录失败：%s", setup_err)
-                    if send_notice:
-                        import html as _html
-                        await send_notice(
-                            f"\u26a0\ufe0f <b>qzone-cron 自动重新登录失败</b>\n"
-                            f"{_html.escape(str(setup_err))}\n\n"
-                            "请手动运行 <code>qzone-cron setup</code>。"
-                        )
-                finally:
-                    _release_setup_lock(lock_file)
-                return
-            else:
-                if send_notice:
-                    import html as _html
-                    await send_notice(
-                        f"\u26a0\ufe0f <b>qzone-cron 登录失效</b>\n"
-                        f"{_html.escape(str(e))}\n\n"
-                        "请运行 <code>qzone-cron setup</code> 重新扫码登录。"
-                    )
-                sys.exit(1)
-
-        state.last_fetched_at = now
-        if feeds:
-            newest_time = max(f.common.time for f in feeds)
-            state.last_fetch_time = float(newest_time)
-        for feed in feeds:
-            fid = getattr(feed, "fid", None)
-            if fid:
-                state.feed_store[fid] = feed_to_dict(feed)
-        state.save()
-
-        if feeds:
-            logger.info(
-                "抓取到 %d 条新说说，更新上次抓取时间为 %s。",
-                len(feeds),
-                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.last_fetch_time)),
-            )
-        else:
-            logger.info("没有新说说。")
-    else:
-        remaining = int(interval_secs - elapsed)
+    if not should_fetch and not do_full_refresh:
         logger.info(
             "距上次抓取仅 %ds，未到抓取间隔（%dmin），跳过抓取，仅执行插件维护任务。",
             int(elapsed),
             config.fetch.fetch_interval_minutes,
         )
-
-    # ── 全量 stats 刷新 ──────────────────────────────────────────────────────
-    updated_feeds: list[dict] = []
-    refresh_interval_secs = config.fetch.stats_refresh_interval_minutes * 60
-    if now - state.last_full_refresh_at >= refresh_interval_secs:
+    else:
+        # 两者都需要时合并为一次请求，取更大的时间窗口避免重复请求
         since_full = now - config.fetch.stats_refresh_window_hours * 3600
-        logger.info(
-            "开始全量 stats 刷新（过去 %.1f 小时）…",
-            config.fetch.stats_refresh_window_hours,
-        )
+        if should_fetch and do_full_refresh:
+            since_time = min(state.last_fetch_time, since_full) if state.last_fetch_time > 0 else since_full
+            logger.info(
+                "开始合并抓取（新说说 + 全量 stats 刷新，UIN: %d，时间窗口: %.1f 小时）…",
+                config.auth.uin,
+                config.fetch.stats_refresh_window_hours,
+            )
+        elif should_fetch:
+            since_time = state.last_fetch_time
+            logger.info(
+                "开始抓取说说（UIN: %d，上次抓取时间: %s）…",
+                config.auth.uin,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.last_fetch_time))
+                if state.last_fetch_time > 0
+                else "从未",
+            )
+        else:  # only do_full_refresh
+            since_time = since_full
+            logger.info(
+                "开始全量 stats 刷新（过去 %.1f 小时）…",
+                config.fetch.stats_refresh_window_hours,
+            )
+
+        raw_feeds: list = []
+        fetch_ok = False
         try:
-            refresh_raw = await fetch_feeds(
+            raw_feeds = await fetch_feeds(
                 uin=config.auth.uin,
                 cookie_file=config.storage.cookie_file,
-                since_time=since_full,
+                since_time=since_time,
                 max_pages=config.fetch.max_pages,
             )
+            fetch_ok = True
+        except RuntimeError as e:
+            if should_fetch:
+                logger.error("%s", e)
+                if config.auth.auto_relogin:
+                    lock_file = config.storage.data_path / "setup.lock"
+                    if not _acquire_setup_lock(lock_file):
+                        pid = lock_file.read_text().strip() if lock_file.exists() else "?"
+                        logger.info(
+                            "登录失效，setup 进程（PID %s）已在运行，等待扫码中，本次跳过。", pid
+                        )
+                        return
+                    logger.info("登录失效，自动触发重新登录（二维码将发送至 Telegram）…")
+                    try:
+                        qr_sender = make_qr_sender(config.telegram)
+                        await setup_login(
+                            config.auth.uin,
+                            config.storage.cookie_file,
+                            qr_sender=qr_sender,
+                        )
+                        logger.info("自动重新登录成功，下次 cron 将恢复正常抓取。")
+                    except Exception as setup_err:
+                        logger.error("自动重新登录失败：%s", setup_err)
+                        if send_notice:
+                            import html as _html
+                            await send_notice(
+                                f"\u26a0\ufe0f <b>qzone-cron 自动重新登录失败</b>\n"
+                                f"{_html.escape(str(setup_err))}\n\n"
+                                "请手动运行 <code>qzone-cron setup</code>。"
+                            )
+                    finally:
+                        _release_setup_lock(lock_file)
+                    return
+                else:
+                    if send_notice:
+                        import html as _html
+                        await send_notice(
+                            f"\u26a0\ufe0f <b>qzone-cron 登录失效</b>\n"
+                            f"{_html.escape(str(e))}\n\n"
+                            "请运行 <code>qzone-cron setup</code> 重新扫码登录。"
+                        )
+                    sys.exit(1)
+            else:
+                logger.warning("全量 stats 刷新失败：%s，跳过。", e)
+                state.last_full_refresh_at = now  # 避免失败后每次 cron 都重试
+                state.save()
+
+        if fetch_ok:
             store = state.feed_store
-            for feed in refresh_raw:
+            known_fids = set(store.keys())  # 抓取前的快照，用于判断是否为新说说
+
+            for feed in raw_feeds:
                 fid = getattr(feed, "fid", None)
-                if not fid or fid not in store:
+                if not fid:
                     continue
                 refreshed = feed_to_dict(feed)
-                old = store[fid]
-                if (
-                    refreshed["like_count"] != old.get("like_count")
-                    or refreshed["comment_count"] != old.get("comment_count")
-                ):
-                    updated_feeds.append(refreshed)
-                store[fid] = refreshed
-            state.last_full_refresh_at = now
-            expired = state.expire_feeds(config.fetch.feed_retention_hours)
-            if expired:
-                logger.info("已清理 %d 条过期 feed。", expired)
-            logger.info(
-                "全量 stats 刷新完成，%d 条 feed 有数据更新。", len(updated_feeds)
-            )
-        except Exception as e:
-            logger.warning("全量 stats 刷新失败：%s，跳过。", e)
-            state.last_full_refresh_at = now  # 避免失败后每次 cron 都重试
-        state.save()
+                if fid not in known_fids:
+                    # 新说说（仅在 should_fetch 时加入通知列表）
+                    if should_fetch:
+                        feeds.append(feed)
+                    store[fid] = refreshed
+                else:
+                    # 已知说说，检查内容或互动数据是否变化
+                    if do_full_refresh:
+                        old = store[fid]
+                        if (
+                            refreshed["like_count"] != old.get("like_count")
+                            or refreshed["comment_count"] != old.get("comment_count")
+                            or refreshed["content"] != old.get("content")
+                            or refreshed["top_comments"] != old.get("top_comments")
+                            or refreshed["image_urls"] != old.get("image_urls")
+                        ):
+                            updated_feeds.append(refreshed)
+                    store[fid] = refreshed
+
+            if should_fetch:
+                state.last_fetched_at = now
+                if feeds:
+                    newest_time = max(f.common.time for f in feeds)
+                    state.last_fetch_time = float(newest_time)
+                    logger.info(
+                        "抓取到 %d 条新说说，更新上次抓取时间为 %s。",
+                        len(feeds),
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.last_fetch_time)),
+                    )
+                else:
+                    logger.info("没有新说说。")
+
+            if do_full_refresh:
+                expired = state.expire_feeds(config.fetch.feed_retention_hours)
+                if expired:
+                    logger.info("已清理 %d 条过期 feed。", expired)
+                state.last_full_refresh_at = now
+                logger.info(
+                    "全量 stats 刷新完成，%d 条 feed 有数据更新。", len(updated_feeds)
+                )
+
+            state.save()
 
     await run_plugins(plugins, feeds, updated_feeds=updated_feeds, context=plugin_context)
 
