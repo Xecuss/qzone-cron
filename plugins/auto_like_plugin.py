@@ -47,7 +47,9 @@ _DEFAULT_SYSTEM_PROMPT = (
     "- 应该点赞：日常生活更新、好消息、出行/美食/照片/运动、有趣或有意义的分享等正常内容\n"
     "- 不应该点赞：自我攻击、情绪极度低落、抑郁倾向、自我否定、发泄强烈负面情绪的说说\n\n"
     "请返回一个 JSON 对象，格式为：{\"fids\": [\"fid1\", \"fid2\", ...]}，"
-    "只包含应该点赞的说说 fid。若全部不应点赞，返回 {\"fids\": []}。"
+    "只包含应该点赞的说说 fid。若全部不应点赞，返回 {\"fids\": []}。\n\n"
+    "注意：直接输出裸 JSON，不要使用 markdown 代码块（不要加 ```json 或 ``` 标记）。\n"
+    "示例输出：{\"fids\": [\"abc123\", \"def456\"]}"
 )
 
 
@@ -159,8 +161,13 @@ async def _should_like_feeds(feeds: list[Any], openai_cfg: dict) -> set[str]:
 
         raw = data["choices"][0]["message"]["content"]
         logger.debug("[LLM 输出] %s", raw)
+        # 兼容部分模型在回复中包裹 markdown 代码块的情况
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            stripped = stripped.split("\n", 1)[-1]
+            stripped = stripped.rsplit("```", 1)[0].strip()
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(stripped)
         except json.JSONDecodeError as e:
             logger.warning("LLM 返回内容无法解析为 JSON（%s），原始内容：%s", e, raw)
             return set()
