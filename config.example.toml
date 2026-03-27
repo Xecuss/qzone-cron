@@ -64,3 +64,26 @@ model = "gpt-4o-mini"
 # vision_model = "gpt-4o-mini"
 # 可选：覆盖默认的系统提示词
 # system_prompt = "你是一位 QQ 空间简报助手..."
+
+# ─── 自动点赞插件 ─────────────────────────────────────────────────────────────
+# 模拟真实点赞行为：通过大模型过滤说说 → 入队 → 随机延迟后批量点赞
+[plugins.auto_like_plugin]
+enabled = true
+# 每次激活时点赞的条数（每次 cron 触发激活状态时处理的说说数量）
+likes_per_cycle = 3
+# 两次点赞之间的随机间隔范围（秒）
+like_interval_min = 5.0
+like_interval_max = 10.0
+# 激活延迟范围（分钟）：新说说入队后，随机等待 [min, max] 分钟再开始点赞
+activation_delay_min = 30
+activation_delay_max = 180
+# 禁止激活的小时列表（本地时间 0-23）：激活时间落在此范围时自动顺延至允许时段
+forbidden_hours = [0, 1, 2, 3, 4, 5, 6]
+
+[plugins.auto_like_plugin.openai]
+# OpenAI 兼容接口，用于判断说说是否应该点赞（不配置则默认全部点赞）
+api_key = "sk-..."
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+# 可选：覆盖默认的判断系统提示词
+# system_prompt = "..."

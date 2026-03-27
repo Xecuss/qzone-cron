@@ -27,5 +27,8 @@ packages = ["src/qzone_cron"]
 name = "aioqzone"
 url = "https://aioqzone.github.io/aioqzone-index/simple"
 
+[dependency-groups]
+dev = []
+
 [tool.uv]
 prerelease = "allow"

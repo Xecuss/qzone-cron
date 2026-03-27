@@ -22,6 +22,7 @@ qzone-cron/
     ├── __init__.py
     ├── print_plugin.py          # 示例插件：打印说说内容
     ├── auto_delete_plugin.py    # 自动删除说说插件
+    ├── auto_like_plugin.py      # 自动点赞插件
     └── daily_summary_plugin.py  # 每日空间简报插件
 ```
 
@@ -149,6 +150,40 @@ uv run qzone-cron run
 # 不等到 summary_hour，立即生成并发送
 uv run qzone-cron send-summary
 ```
+
+### `auto_like_plugin` — 自动点赞
+
+模拟真实用户点赞习惯：通过大模型过滤说说（排除情绪低落、自我攻击类内容）后入队，随机延迟一段时间后批量点赞，并自动回避凌晨等不适宜操作的时段。
+
+**工作流程：**
+
+1. 每次 `run` 抓取到好友说说后，批量发给大模型判断是否应该点赞
+2. 通过筛选的说说入待点赞队列，并预计算一个随机激活时间
+3. cron 运行到激活时间后，每次取若干条点赞（条数可配置），每两条之间随机等待 5-10 秒
+4. 队列清空后重新预计算下一次激活时间
+5. 激活时间若落在禁止时段（如凌晨）内，自动顺延到允许的小时
+
+**配置示例（`config.toml`）：**
+
+```toml
+[plugins.auto_like_plugin]
+enabled = true
+likes_per_cycle = 3           # 每次激活处理的条数
+like_interval_min = 5.0       # 两次点赞之间的最短间隔（秒）
+like_interval_max = 10.0      # 两次点赞之间的最长间隔（秒）
+activation_delay_min = 30     # 激活延迟最短时间（分钟）
+activation_delay_max = 180    # 激活延迟最长时间（分钟）
+forbidden_hours = [0,1,2,3,4,5,6]  # 禁止激活的小时（本地时间 0-23）
+
+[plugins.auto_like_plugin.openai]
+api_key = "sk-..."
+base_url = "https://api.openai.com/v1"  # 可替换为任意 OpenAI 兼容接口
+model = "gpt-4o-mini"
+# json_mode = true    # 开启 response_format: json_object（仅 OpenAI 官方等部分模型支持）
+# system_prompt = "..."  # 可选，覆盖内置的点赞判断提示词
+```
+
+> **提示**：不配置 `[plugins.auto_like_plugin.openai]` 时，所有好友说说均会进入点赞队列（无 LLM 过滤）。
 
 ## 编写插件
 
