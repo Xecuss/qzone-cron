@@ -11,4 +11,5 @@ wheels/
 
 config.toml
 data
-data/*
+cache
+qrcode.png
