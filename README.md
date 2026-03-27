@@ -85,6 +85,51 @@ qzone-cron send-summary [-c config.toml] [-p plugins/] [-v]
 
 `send-summary` — 忽略 `summary_times` 时间限制，立即用队列中已有的说说生成简报并发送，主要用于测试。若队列为空，可先执行一次 `qzone-cron run` 抓取说说再调用。
 
+## 全局配置
+
+`config.toml` 中有四个顶层配置块，影响主流程行为。
+
+### `[auth]` — 账号与登录
+
+```toml
+[auth]
+uin = 123456789           # 你的 QQ 号
+auto_relogin = false      # Cookie 失效时自动发起重登并推送二维码到 Telegram
+```
+
+### `[storage]` — 数据存储
+
+```toml
+[storage]
+data_dir = "~/.local/share/qzone-cron"   # Cookie / 状态文件存放目录（支持 ~ 路径）
+```
+
+### `[fetch]` — 抓取行为与全量更新
+
+```toml
+[fetch]
+max_pages = 10                      # 每次最多抓取的页数（每页约 10-20 条）
+time_window_hours = 24.0            # 首次运行（无状态文件）时的回溯时间窗口（小时）
+fetch_interval_minutes = 5          # 实际抓取间隔（分钟）；crontab 可高频触发，两次抓取之间只执行插件维护任务
+stats_refresh_interval_minutes = 60 # 全量 stats 刷新间隔：每隔此时间重新拉取近期说说以更新点赞/评论数
+stats_refresh_window_hours = 6.0    # 全量刷新覆盖的时间范围（小时）
+feed_retention_hours = 48.0         # feed 详情在内存中的保留时长（小时），须 >= stats_refresh_window_hours
+```
+
+**全量 stats 刷新**：普通增量抓取只能拿到新发布的说说，已有说说的点赞/评论数不会自动更新。每隔 `stats_refresh_interval_minutes` 分钟，主流程会重新拉取过去 `stats_refresh_window_hours` 小时内的所有说说并刷新点赞、评论等互动数据，再回调各插件的 `process()`，使插件能感知到数据变化（如评论数增加）。
+
+### `[telegram]` — 全局 Telegram 通知
+
+配置后，主流程（如检测到登录失效、`auto_relogin` 推送二维码）与各插件均可通过 `context["send_notice"]` 发送通知消息。
+
+```toml
+[telegram]
+bot_token = "123456:ABC-..."      # 通过 @BotFather 创建的 Bot Token
+chat_id = "-1001234567890"        # 发送目标的 Chat ID（个人、群组或频道均可）
+```
+
+> 插件通过 `context["send_notice"]` 调用，未配置时该函数为 `None`，插件应做判空处理。
+
 ## 内置插件
 
 ### `auto_delete_plugin` — 自动删除说说
@@ -122,11 +167,6 @@ enabled = false
 **配置示例（`config.toml`）：**
 
 ```toml
-# 全局 Telegram 配置（主流程和所有插件共用）
-[telegram]
-bot_token = "123456:ABC-..."
-chat_id = "-1001234567890"
-
 [plugins.daily_summary_plugin]
 enabled = true
 summary_times = ["08:00", "20:00"]  # 每天推送时间点，可配置多个
