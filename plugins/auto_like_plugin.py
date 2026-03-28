@@ -265,12 +265,12 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
         should_like_fids = await _should_like_feeds(friend_feeds, openai_cfg)
         existing_fids = {item["fid"] for item in state["pending_items"]}
 
-        added_count = 0
+        new_items: list[dict] = []
         for feed in friend_feeds:
             fid = getattr(feed, "fid", None)
             if not fid or fid not in should_like_fids or fid in existing_fids:
                 continue
-            state["pending_items"].append({
+            new_items.append({
                 "fid": fid,
                 "uin": feed.userinfo.uin,
                 "nickname": feed.userinfo.nickname or str(feed.userinfo.uin),
@@ -279,10 +279,11 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
                 "curkey": str(feed.common.curkey),
             })
             existing_fids.add(fid)
-            added_count += 1
 
-        if added_count:
-            logger.info("新增 %d 条待点赞说说，队列共 %d 条。", added_count, len(state["pending_items"]))
+        if new_items:
+            # 新说说插到队列头部，保证从最新的开始点赞（类似人看到新内容先点赞）
+            state["pending_items"] = new_items + state["pending_items"]
+            logger.info("新增 %d 条待点赞说说，队列共 %d 条。", len(new_items), len(state["pending_items"]))
 
     # ── 步骤2：若队列非空且尚未预计算激活时间，则计算激活时间 ───────────────
     if state["pending_items"] and state["next_activation_time"] is None:
