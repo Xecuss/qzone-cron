@@ -13,6 +13,7 @@ def feed_to_dict(feed: Any) -> dict:
     uin: int = feed.userinfo.uin
     nickname: str = feed.userinfo.nickname or str(uin)
     post_time: int = int(feed.common.time)
+    appid: int = feed.common.appid
     content: str = (feed.summary.summary if feed.summary else "") or ""
     fid: str = getattr(feed, "fid", f"{uin}_{post_time}")
 
@@ -75,6 +76,7 @@ def feed_to_dict(feed: Any) -> dict:
         "uin": uin,
         "nickname": nickname,
         "time": post_time,
+        "appid": appid,
         "content": content,
         "has_images": has_images,
         "has_video": has_video,

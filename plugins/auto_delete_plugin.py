@@ -92,7 +92,58 @@ async def _delete_feed(fid: str, appid: int, uin: int, cookie_file: Path) -> boo
         return False
 
 
-async def process(feeds: list[Any], context: dict | None = None) -> None:
+async def _register_autodelete(
+    fid: str,
+    appid: int,
+    scheduled_at: float,
+    match: re.Match,
+    owner_uin: int,
+    cookie_file: Path,
+    still_pending: list[dict],
+    pending_fids: set[str],
+    now: float,
+    content_preview: str = "",
+) -> bool:
+    """登记一条自动删除任务；若已到期则立即删除。返回 True 表示新增了延迟任务。"""
+    delay = _parse_delay(match)
+    delete_at = scheduled_at + delay
+
+    if delete_at <= now:
+        success = await _delete_feed(fid=fid, appid=appid, uin=owner_uin, cookie_file=cookie_file)
+        if success:
+            logger.info("说说 %s 已即时删除。", fid)
+        else:
+            still_pending.append({
+                "fid": fid,
+                "appid": appid,
+                "delete_at": now,
+                "scheduled_at": scheduled_at,
+                "content_preview": content_preview,
+            })
+        return False
+    else:
+        logger.info(
+            "说说 %s 将于 %s 被删除（延迟：%s）。",
+            fid,
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(delete_at)),
+            match.group(0).strip(),
+        )
+        still_pending.append({
+            "fid": fid,
+            "appid": appid,
+            "delete_at": delete_at,
+            "scheduled_at": scheduled_at,
+            "content_preview": content_preview,
+        })
+        pending_fids.add(fid)
+        return True
+
+
+async def process(
+    feeds: list[Any],
+    context: dict | None = None,
+    updated_feeds: list[dict] | None = None,
+) -> None:
     if context is None:
         logger.warning("未收到 context，跳过自动删除处理。")
         return
@@ -157,54 +208,88 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
 
         fid: str = feed.fid
         appid: int = feed.common.appid
+        scheduled_at = float(feed.common.time)
 
         if fid in pending_fids:
             logger.debug("说说 %s 已在待删除队列中，跳过。", fid)
             continue
 
-        delay = _parse_delay(match)
-        delete_at = now + delay
-
-        if delay == 0.0:
-            # 即时删除
-            success = await _delete_feed(
-                fid=fid,
-                appid=appid,
-                uin=owner_uin,
-                cookie_file=cookie_file,
-            )
-            if success:
-                logger.info("说说 %s 已即时删除。", fid)
-            else:
-                # 删除失败，加入队列等待下次重试
-                still_pending.append(
-                    {
-                        "fid": fid,
-                        "appid": appid,
-                        "delete_at": now,
-                        "scheduled_at": float(feed.common.time),
-                        "content_preview": content[:100],
-                    }
-                )
-        else:
-            logger.info(
-                "说说 %s 将于 %s 被删除（延迟：%s）。",
-                fid,
-                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(delete_at)),
-                match.group(0).strip(),
-            )
-            still_pending.append(
-                {
-                    "fid": fid,
-                    "appid": appid,
-                    "delete_at": delete_at,
-                    "scheduled_at": float(feed.common.time),
-                    "content_preview": content[:100],
-                }
-            )
+        scheduled = await _register_autodelete(
+            fid=fid,
+            appid=appid,
+            scheduled_at=scheduled_at,
+            match=match,
+            owner_uin=owner_uin,
+            cookie_file=cookie_file,
+            still_pending=still_pending,
+            pending_fids=pending_fids,
+            now=now,
+            content_preview=content[:100],
+        )
+        if scheduled:
             new_scheduled_count += 1
 
     if new_scheduled_count:
         logger.info("新登记 %d 条待删除说说。", new_scheduled_count)
+
+    # ── 步骤3：处理全量刷新中内容有变化的自己发布的说说 ──────────────────
+    if updated_feeds:
+        for feed_dict in updated_feeds:
+            if feed_dict.get("uin") != owner_uin:
+                continue
+
+            fid_upd: str | None = feed_dict.get("fid")
+            if not fid_upd:
+                continue
+
+            content_upd: str = feed_dict.get("content", "") or ""
+            match_upd = _AUTODELETE_RE.search(content_upd)
+
+            if fid_upd in pending_fids:
+                # 说说已在待删除队列中，检查指令是否变化
+                existing = next((item for item in still_pending if item["fid"] == fid_upd), None)
+                if existing is None:
+                    continue
+
+                if not match_upd:
+                    # /autodelete 指令已被移除，取消计划删除
+                    still_pending = [item for item in still_pending if item["fid"] != fid_upd]
+                    pending_fids.discard(fid_upd)
+                    logger.info("说说 %s 已移除 /autodelete 指令，取消计划删除。", fid_upd)
+                    continue
+
+                new_delay = _parse_delay(match_upd)
+                new_delete_at = existing["scheduled_at"] + new_delay
+                if abs(new_delete_at - existing["delete_at"]) > 1:
+                    logger.info(
+                        "说说 %s 的自动删除时间已更新：%s → %s。",
+                        fid_upd,
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(existing["delete_at"])),
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(new_delete_at)),
+                    )
+                    existing["delete_at"] = new_delete_at
+                    existing["content_preview"] = content_upd[:100]
+            else:
+                # 说说不在队列中，检查是否新增了 /autodelete 指令
+                if not match_upd:
+                    continue
+
+                appid_upd = feed_dict.get("appid")
+                if not appid_upd:
+                    logger.debug("说说 %s 缺少 appid，无法登记自动删除。", fid_upd)
+                    continue
+
+                await _register_autodelete(
+                    fid=fid_upd,
+                    appid=appid_upd,
+                    scheduled_at=float(feed_dict.get("time", now)),
+                    match=match_upd,
+                    owner_uin=owner_uin,
+                    cookie_file=cookie_file,
+                    still_pending=still_pending,
+                    pending_fids=pending_fids,
+                    now=now,
+                    content_preview=content_upd[:100],
+                )
 
     _save_pending(state_file, still_pending)
