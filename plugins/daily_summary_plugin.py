@@ -176,7 +176,8 @@ async def _compute_image_descs(
                     feed.original.summary.summary if feed.original.summary else ""
                 ) or ""
                 orig_urls: list[str] = []
-                for pic in feed.original.pic.picdata:
+                # getattr 已验证 feed.original.pic.picdata 存在，type checker 无法追踪
+                for pic in feed.original.pic.picdata:  # type: ignore[attr-defined]
                     try:
                         orig_urls.append(str(pic.photourl.largest.url))
                     except Exception:
