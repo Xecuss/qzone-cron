@@ -291,6 +291,14 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
 
     # ── 步骤3：检查是否已到达激活时间 ──────────────────────────────────────
     now = time.time()
+    logger.info(
+        "[诊断] 队列长度=%d，next_activation_time=%s，now=%s，差值=%.1f 分钟",
+        len(state["pending_items"]),
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state["next_activation_time"]))
+        if state["next_activation_time"] else "None",
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+        (state["next_activation_time"] - now) / 60 if state["next_activation_time"] else float("nan"),
+    )
     if (
         state["pending_items"]
         and state["next_activation_time"] is not None
