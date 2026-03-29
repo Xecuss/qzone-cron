@@ -11,6 +11,7 @@ import click
 
 from .config import load_config
 from .fetcher import feed_to_dict, fetch_feeds, setup_login
+from .llm import chat_completion
 from .notifier import make_poll_updates, make_qr_sender, make_send_message, make_send_notice
 from .plugin_loader import load_plugins, run_plugins
 from .state import State
@@ -149,6 +150,8 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         "cookie_file": config.storage.cookie_file,
         "data_dir": config.storage.data_path,
         "plugins_config": config.plugins,
+        "global_openai_cfg": config.openai.as_dict(),
+        "llm_chat": chat_completion,
         "send_notice": send_notice,
         "tg_send_message": send_message,
         "feed_store": state.feed_store,  # 与 state.feed_store 同一对象引用，后续更新自动可见
@@ -377,6 +380,8 @@ async def _send_summary(config_path: Path, plugins_dir: Path) -> None:
         "cookie_file": config.storage.cookie_file,
         "data_dir": config.storage.data_path,
         "plugins_config": config.plugins,
+        "global_openai_cfg": config.openai.as_dict(),
+        "llm_chat": chat_completion,
         "send_notice": send_notice,
         "feed_store": state.feed_store,
     }

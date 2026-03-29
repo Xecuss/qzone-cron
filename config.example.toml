@@ -36,6 +36,17 @@ bot_token = "123456:ABC-..."
 # 发送目标的 Chat ID（个人用户、群组或频道均可）
 chat_id = "-1001234567890"
 
+# ─── 全局大模型配置 ───────────────────────────────────────────────────────────
+# 各插件未单独配置 [plugins.<name>.openai] 时自动回退到此处的设置。
+# 插件级别的配置优先级更高，可按需覆盖 api_key / base_url / model 等字段。
+[openai]
+# OpenAI 兼容接口的 API Key
+api_key = "sk-..."
+# 接口地址，可替换为 Azure / DeepSeek / 本地 Ollama 等兼容接口
+base_url = "https://api.openai.com/v1"
+# 默认使用的模型名称
+model = "gpt-4o-mini"
+
 # ─── 插件配置 ────────────────────────────────────────────────────────────────
 # 每个在 plugins/ 目录中的 .py 文件对应一个插件，文件名（不含 .py）作为配置键。
 
@@ -52,7 +63,8 @@ summary_times = ["08:00"]
 vip_uins = []
 
 [plugins.daily_summary_plugin.openai]
-# OpenAI 兼容接口的 API Key
+# 插件级大模型配置（可选）：填写后将覆盖顶层 [openai] 的同名字段。
+# 若完全不配置此节，插件将自动使用顶层 [openai] 的设置。
 api_key = "sk-..."
 # 接口地址，默认为 OpenAI 官方，可替换为 Azure/Claude/本地 LLM 等兼容接口
 base_url = "https://api.openai.com/v1"
@@ -81,7 +93,8 @@ activation_delay_max = 180
 forbidden_hours = [0, 1, 2, 3, 4, 5, 6]
 
 [plugins.auto_like_plugin.openai]
-# OpenAI 兼容接口，用于判断说说是否应该点赞（不配置则默认全部点赞）
+# 插件级大模型配置（可选）：填写后将覆盖顶层 [openai] 的同名字段。
+# 若完全不配置此节，插件将自动使用顶层 [openai] 的设置（不配置任何 openai 则默认全部点赞）。
 api_key = "sk-..."
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"

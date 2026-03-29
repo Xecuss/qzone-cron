@@ -15,6 +15,7 @@ qzone-cron/
 │       ├── __main__.py     # CLI 入口（setup / run / send-summary 命令）
 │       ├── config.py       # 配置加载（TOML + Pydantic）
 │       ├── fetcher.py      # QQ 空间说说抓取
+│       ├── llm.py          # LLM 调用统一接口
 │       ├── notifier.py     # 全局通知（Telegram send_notice）
 │       ├── plugin_loader.py # 插件加载与分发
 │       └── state.py        # 运行状态持久化
@@ -130,6 +131,22 @@ chat_id = "-1001234567890"        # 发送目标的 Chat ID（个人、群组或
 
 > 插件通过 `context["send_notice"]` 调用，未配置时该函数为 `None`，插件应做判空处理。
 
+### `[openai]` — 全局大模型配置
+
+需要调用 LLM（如 `daily_summary_plugin`、`auto_like_plugin`）的插件会使用此处的配置。各插件也可在单独的 `[plugins.<name>.openai]` 中覆盖相应字段。
+
+```toml
+[openai]
+api_key = "sk-..."                           # OpenAI 兼容接口的 API Key
+base_url = "https://api.openai.com/v1"       # 接口地址（可替换为 Azure / DeepSeek / 本地 Ollama 等）
+model = "gpt-4o-mini"                        # 默认使用的模型名称
+```
+
+**配置优先级**（从高到低）：
+1. `[plugins.<name>.openai]` 中显式写的字段
+2. `[openai]` 全局字段
+3. 代码内硬编码默认值
+
 ## 内置插件
 
 | 插件 | 说明 |
@@ -155,12 +172,15 @@ async def process(feeds: list, context: dict | None = None) -> None:
     """
     feeds:   本次新抓取到的说说列表（aioqzone FeedData 对象）
     context: 运行上下文，包含以下键：
-               uin            — 账号 QQ 号
-               cookie_file    — Cookie 文件路径
-               data_dir       — 数据目录（Path）
-               plugins_config — 插件配置字典
-               send_notice    — 全局 Telegram 通知函数（async (str) -> None）
-                                未配置全局 [telegram] 时为 None
+               uin              — 账号 QQ 号
+               cookie_file      — Cookie 文件路径
+               data_dir         — 数据目录（Path）
+               plugins_config   — 插件配置字典
+               global_openai_cfg — 全局 [openai] 配置字典（含 api_key / base_url / model）
+               llm_chat         — LLM 调用函数 (async (cfg, messages, **kwargs) -> str)
+               send_notice      — 全局 Telegram 通知函数（async (str) -> None）
+                                  未配置全局 [telegram] 时为 None
+               feed_store       — 保存最近 feed 详情的字典（用于后续查询）
 
     常用 feed 字段：
       feed.userinfo.uin         — 发布者 QQ 号
@@ -180,6 +200,53 @@ async def process(feeds: list, context: dict | None = None) -> None:
         if send_notice:
             await send_notice(f"新说说：{feed.summary.summary}")
 ```
+
+### 在插件中调用大模型
+
+若需调用 LLM（如用来分析或生成说说内容），可使用 `context["llm_chat"]` 函数：
+
+```python
+async def process(feeds: list, context: dict | None = None) -> None:
+    if context is None:
+        return
+    
+    llm_chat = context.get("llm_chat")
+    if llm_chat is None:
+        return  # 未配置 LLM
+    
+    # 获取插件自己的配置及全局 OpenAI 配置
+    plugin_cfg = (context.get("plugins_config") or {}).get("my_plugin", {})
+    global_openai_cfg = context.get("global_openai_cfg") or {}
+    
+    # 合并配置（插件配置优先级更高）
+    openai_cfg = {**global_openai_cfg, **plugin_cfg.get("openai", {})}
+    
+    for feed in feeds:
+        # 调用 LLM，获取分析结果
+        result = await llm_chat(
+            openai_cfg,
+            [
+                {"role": "system", "content": "你是一个说说分析助手。"},
+                {"role": "user", "content": f"分析这条说说：{feed.summary.summary}"},
+            ],
+            timeout=30.0,
+            max_tokens=100,
+        )
+        print(f"分析结果：{result}")
+```
+
+插件配置示例：
+
+```toml
+[plugins.my_plugin]
+enabled = true
+
+# 可选：覆盖全局 [openai] 配置
+[plugins.my_plugin.openai]
+model = "gpt-4"
+```
+
+### 禁用插件
 
 插件也可在 `config.toml` 中通过 `enabled = false` 禁用：
 

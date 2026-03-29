@@ -13,20 +13,51 @@
 
 ## 配置示例
 
+### 基础配置（推荐）
+
+在顶层全局 `[openai]` 配置 LLM 参数，插件会自动使用：
+
 ```toml
+[openai]
+api_key = "sk-..."
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+
+[telegram]
+bot_token = "123456:ABC-..."
+chat_id = "-1001234567890"
+
 [plugins.daily_summary_plugin]
 enabled = true
 summary_times = ["08:00", "20:00"]  # 每天推送时间点，可配置多个
 vip_uins = [12345678]               # 特别关注的 QQ 号列表
+```
 
+### 进阶配置（插件级覆盖）
+
+若需与其他插件使用不同的模型或独立配置，可在插件级配置中覆盖特定字段：
+
+```toml
+[plugins.daily_summary_plugin]
+enabled = true
+summary_times = ["08:00", "20:00"]
+vip_uins = [12345678]
+
+# 可选：覆盖全局 [openai] 的字段
 [plugins.daily_summary_plugin.openai]
-api_key = "sk-..."
-base_url = "https://api.openai.com/v1"  # 可替换为任意 OpenAI 兼容接口
-model = "gpt-4o-mini"                   # 用于生成简报
+api_key = "sk-..."  # 若需使用不同的 API Key
+model = "gpt-4"    # 只覆盖模型，base_url 仍沿用全局配置
 # describe_images = true    # 入队时自动调用视觉模型预描述图片（默认开启）
 # vision_model = "gpt-4o"  # 可选，单独指定视觉模型；不填则复用 model
 # system_prompt = "..."    # 可选，覆盖内置系统提示词
 ```
+
+**配置优先级**（从高到低）：
+1. `[plugins.daily_summary_plugin.openai]` 中显式配置的字段
+2. `[openai]` 全局配置
+3. 编码默认值
+
+> **必需项**：需配置全局 `[openai]` 或插件级 `[plugins.daily_summary_plugin.openai]` 中至少一个 `api_key`；同时需配置全局 `[telegram]` 方可发送简报。
 
 ## 测试简报发送
 

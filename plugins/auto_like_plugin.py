@@ -103,18 +103,13 @@ def _compute_next_activation(cfg: dict) -> float:
 # ─── LLM filtering ────────────────────────────────────────────────────────────
 
 
-async def _should_like_feeds(feeds: list[Any], openai_cfg: dict) -> set[str]:
+async def _should_like_feeds(feeds: list[Any], openai_cfg: dict, llm_chat: Any) -> set[str]:
     """通过大模型判断哪些说说应该点赞，返回应点赞的 fid 集合。
     未配置 LLM 时默认全部点赞。"""
-    if not openai_cfg.get("api_key"):
+    if not openai_cfg.get("api_key") or llm_chat is None:
         logger.debug("未配置 OpenAI API Key，默认对所有说说点赞。")
         return {fid for f in feeds if (fid := getattr(f, "fid", None)) is not None}
 
-    import httpx
-
-    api_key: str = openai_cfg["api_key"]
-    base_url: str = openai_cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
-    model: str = openai_cfg.get("model", "gpt-4o-mini")
     system_prompt: str = openai_cfg.get("system_prompt", _DEFAULT_SYSTEM_PROMPT)
 
     # 构建用户消息：每条说说一行
@@ -135,31 +130,21 @@ async def _should_like_feeds(feeds: list[Any], openai_cfg: dict) -> set[str]:
         user_message,
     )
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload: dict = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        "max_tokens": 500,
-    }
+    extra: dict = {"max_tokens": 500}
     # response_format 仅部分模型支持（如 gpt-4o 系列），可通过配置显式开启
     if openai_cfg.get("json_mode", False):
-        payload["response_format"] = {"type": "json_object"}
+        extra["response_format"] = {"type": "json_object"}
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions", headers=headers, json=payload
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        raw = data["choices"][0]["message"]["content"]
+        raw = await llm_chat(
+            openai_cfg,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            timeout=30.0,
+            **extra,
+        )
         logger.debug("[LLM 输出] %s", raw)
         # 兼容部分模型在回复中包裹 markdown 代码块的情况
         stripped = raw.strip()
@@ -239,7 +224,9 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
     cookie_file: Path | None = context.get("cookie_file")
     data_dir: Path | None = context.get("data_dir")
     plugin_cfg: dict = (context.get("plugins_config") or {}).get("auto_like_plugin", {})
-    openai_cfg: dict = plugin_cfg.get("openai", {})
+    global_openai_cfg: dict = context.get("global_openai_cfg") or {}
+    openai_cfg: dict = {**global_openai_cfg, **plugin_cfg.get("openai", {})}
+    llm_chat: Any = context.get("llm_chat")
 
     if not owner_uin or not cookie_file:
         logger.warning("context 中缺少 uin 或 cookie_file，跳过自动点赞处理。")
@@ -262,7 +249,7 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
     friend_feeds = [f for f in feeds if f.userinfo.uin != owner_uin]
 
     if friend_feeds:
-        should_like_fids = await _should_like_feeds(friend_feeds, openai_cfg)
+        should_like_fids = await _should_like_feeds(friend_feeds, openai_cfg, llm_chat)
         existing_fids = {item["fid"] for item in state["pending_items"]}
 
         new_items: list[dict] = []

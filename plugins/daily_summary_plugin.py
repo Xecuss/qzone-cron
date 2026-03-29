@@ -107,23 +107,20 @@ def _save_state(state_file: Path, state: dict) -> None:
 
 
 async def _describe_images(
-    openai_cfg: dict, image_urls: list[str], context_text: str
+    openai_cfg: dict, image_urls: list[str], context_text: str, llm_chat: Any
 ) -> str | None:
     """调用视觉模型对图片内容进行预描述，失败时静默返回 None。
 
     可通过 openai.describe_images = false 关闭；
     可通过 openai.vision_model 指定不同于摘要生成的模型。
     """
-    if not image_urls or not openai_cfg.get("api_key"):
+    if not image_urls or not openai_cfg.get("api_key") or llm_chat is None:
         return None
     if not openai_cfg.get("describe_images", True):
         return None
 
-    import httpx
-
-    api_key: str = openai_cfg.get("api_key", "")
-    base_url: str = openai_cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
-    model: str = openai_cfg.get("vision_model") or openai_cfg.get("model", "gpt-4o-mini")
+    vision_model: str = openai_cfg.get("vision_model") or openai_cfg.get("model", "gpt-4o-mini")
+    vision_cfg = {**openai_cfg, "model": vision_model}
 
     prompt_text = "请用1-2句话简洁描述这些图片的内容"
     if context_text.strip():
@@ -134,30 +131,20 @@ async def _describe_images(
     for url in image_urls[:4]:  # 最多处理 4 张，避免 token 消耗过大
         content_parts.append({"type": "image_url", "image_url": {"url": url}})
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": content_parts}],
-        "max_tokens": 150,
-    }
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions", headers=headers, json=payload
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return await llm_chat(
+            vision_cfg,
+            [{"role": "user", "content": content_parts}],
+            timeout=30.0,
+            max_tokens=150,
+        )
     except Exception as e:
         logger.warning("图片描述生成失败（%s），将仅记录「含图片」。", e)
         return None
 
 
 async def _compute_image_descs(
-    fid: str, feed: Any, openai_cfg: dict, cache: dict
+    fid: str, feed: Any, openai_cfg: dict, cache: dict, llm_chat: Any
 ) -> None:
     """计算 feed（及其转发原文）的图片描述并写入 cache，已缓存则跳过。"""
     # 主帖图片
@@ -172,7 +159,7 @@ async def _compute_image_descs(
                 except Exception:
                     pass
             if image_urls:
-                desc = await _describe_images(openai_cfg, image_urls, content)
+                desc = await _describe_images(openai_cfg, image_urls, content, llm_chat)
                 if desc:
                     cache[fid] = desc
 
@@ -195,7 +182,7 @@ async def _compute_image_descs(
                     except Exception:
                         pass
                 if orig_urls:
-                    desc = await _describe_images(openai_cfg, orig_urls, orig_content)
+                    desc = await _describe_images(openai_cfg, orig_urls, orig_content, llm_chat)
                     if desc:
                         cache[orig_key] = desc
 
@@ -346,33 +333,17 @@ def _check_trigger(state: dict, summary_times: list[str], now: datetime) -> bool
 # ─── OpenAI compatible API call ───────────────────────────────────────────────
 
 
-async def _call_openai(cfg: dict, user_prompt: str) -> str:
-    import httpx
-
-    api_key: str = cfg.get("api_key", "")
-    base_url: str = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
-    model: str = cfg.get("model", "gpt-4o-mini")
+async def _call_openai(cfg: dict, user_prompt: str, llm_chat: Any) -> str:
     system_prompt: str = cfg.get("system_prompt", "") or _DEFAULT_SYSTEM_PROMPT
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "messages": [
+    return await llm_chat(
+        cfg,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.7,
-    }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            f"{base_url}/chat/completions", headers=headers, json=payload
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+        timeout=60.0,
+        temperature=0.7,
+    )
 
 
 # ─── Shared send logic ────────────────────────────────────────────────────────
@@ -386,6 +357,7 @@ async def _do_send(
     vip_uins: set[int],
     summary_times: list[str],
     send_notice: Any,
+    llm_chat: Any,
     *,
     force: bool = False,
 ) -> None:
@@ -437,7 +409,7 @@ async def _do_send(
     user_prompt = _build_prompt(pending_records, now)
 
     try:
-        summary = await _call_openai(openai_cfg, user_prompt)
+        summary = await _call_openai(openai_cfg, user_prompt, llm_chat)
     except Exception as e:
         logger.error("调用 OpenAI API 失败：%s，队列保留，下次推送时间点自动重试。", e)
         # 不更新 last_check_time，下次运行仍会触发
@@ -480,7 +452,8 @@ def _resolve_context(context: dict) -> tuple[dict, int | None, Path | None, dict
     cfg: dict = plugins_config.get("daily_summary_plugin", {})
     owner_uin: int | None = context.get("uin")
     data_dir: Path | None = context.get("data_dir")
-    openai_cfg: dict = cfg.get("openai", {})
+    global_openai_cfg: dict = context.get("global_openai_cfg") or {}
+    openai_cfg: dict = {**global_openai_cfg, **cfg.get("openai", {})}
     summary_times: list[str] = cfg.get("summary_times", ["08:00"])
     vip_uins: set[int] = set(cfg.get("vip_uins", []))
     return cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins
@@ -508,6 +481,7 @@ async def process(
         return
 
     send_notice = context.get("send_notice")
+    llm_chat: Any = context.get("llm_chat")
     cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins = (
         _resolve_context(context)
     )
@@ -534,7 +508,7 @@ async def process(
         if fid in existing_fids:
             continue
         # 趁有原始对象时计算图片描述（已缓存则自动跳过）
-        await _compute_image_descs(fid, feed, openai_cfg, state["image_desc_cache"])
+        await _compute_image_descs(fid, feed, openai_cfg, state["image_desc_cache"], llm_chat)
         state["pending_feed_ids"].append(fid)
         existing_fids.add(fid)
         added += 1
@@ -554,7 +528,7 @@ async def process(
 
     # ── 步骤 2：按时间决定是否发送 ───────────────────────────────────────────
     await _do_send(
-        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice
+        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice, llm_chat
     )
 
 
@@ -572,6 +546,7 @@ async def force_send(context: dict | None = None) -> None:
         return
 
     send_notice = context.get("send_notice")
+    llm_chat: Any = context.get("llm_chat")
     cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins = (
         _resolve_context(context)
     )
@@ -593,5 +568,5 @@ async def force_send(context: dict | None = None) -> None:
         "force_send: 队列中有 %d 条动态，立即生成简报…", len(state["pending_feed_ids"])
     )
     await _do_send(
-        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice, force=True
+        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice, llm_chat, force=True
     )

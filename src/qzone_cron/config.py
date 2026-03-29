@@ -60,11 +60,31 @@ class TelegramConfig(BaseModel):
         return bool(self.bot_token and self.chat_id)
 
 
+class OpenAIConfig(BaseModel):
+    """顶层全局大模型配置，各插件未单独配置时自动回退至此。"""
+
+    api_key: str = ""
+    base_url: str = "https://api.openai.com/v1"
+    model: str = "gpt-4o-mini"
+
+    def as_dict(self) -> dict[str, Any]:
+        """返回可直接传给插件的字典，仅包含非空字段。"""
+        d: dict[str, Any] = {}
+        if self.api_key:
+            d["api_key"] = self.api_key
+        if self.base_url:
+            d["base_url"] = self.base_url
+        if self.model:
+            d["model"] = self.model
+        return d
+
+
 class Config(BaseModel):
     auth: AuthConfig
     storage: StorageConfig = Field(default_factory=StorageConfig)
     fetch: FetchConfig = Field(default_factory=FetchConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     plugins: dict[str, Any] = Field(default_factory=dict)
 
 
