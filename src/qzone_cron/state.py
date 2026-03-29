@@ -55,6 +55,15 @@ class State:
         """feed 详情存储：fid → 序列化的 feed 字典（不含 AI 生成内容）。"""
         return self._data.setdefault("feed_store", {})
 
+    @property
+    def tg_update_offset(self) -> int:
+        """Telegram getUpdates 的消费位点，避免重复处理旧消息。"""
+        return int(self._data.get("tg_update_offset", 0))
+
+    @tg_update_offset.setter
+    def tg_update_offset(self, value: int) -> None:
+        self._data["tg_update_offset"] = value
+
     def expire_feeds(self, retention_hours: float) -> int:
         """清除早于 retention_hours 的 feed，返回被清除的条数。"""
         cutoff = _time.time() - retention_hours * 3600

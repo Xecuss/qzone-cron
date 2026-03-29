@@ -87,3 +87,10 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 # 可选：覆盖默认的判断系统提示词
 # system_prompt = "..."
+
+# ─── 达到点赞阈值后公布第二段内容插件 ────────────────────────────────────────
+[plugins.like_to_show_plugin]
+enabled = true
+# 默认的发布方式（可在说说指令中逐条覆盖）
+# 可选值：comment（评论区发布）| new（发布新说说）| append（删原说说+合并内容发新）| delete（删原说说+仅发新内容）
+default_edit_method = "comment"

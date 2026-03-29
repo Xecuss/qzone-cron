@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 _TG_MAX_LEN = 4096
 
 SendNotice = Callable[[str], Awaitable[None]]
+SendMessage = Callable[[str], Awaitable["int | None"]]
+PollUpdates = Callable[[int], Awaitable["tuple[list[dict], int]"]]
 
 
 async def _send_telegram(bot_token: str, chat_id: str, text: str) -> None:
@@ -52,6 +54,79 @@ async def _send_telegram(bot_token: str, chat_id: str, text: str) -> None:
             }
             resp = await client.post(url, json=payload)
             resp.raise_for_status()
+
+
+async def _send_telegram_single(bot_token: str, chat_id: str, text: str) -> int:
+    """发送单条 Telegram 消息，返回 message_id。文本超长时截断到 4096 字符。"""
+    import httpx
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text[:_TG_MAX_LEN],
+        "parse_mode": "HTML",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        return int(resp.json()["result"]["message_id"])
+
+
+async def _poll_telegram_updates(bot_token: str, offset: int) -> tuple[list[dict], int]:
+    """调用 getUpdates 拉取从 offset 开始的新消息，返回 (updates, new_offset)。"""
+    import httpx
+
+    url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+    params: dict = {"offset": offset, "timeout": 0, "allowed_updates": ["message"]}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    updates: list[dict] = data.get("result", [])
+    new_offset = updates[-1]["update_id"] + 1 if updates else offset
+    return updates, new_offset
+
+
+def make_send_message(cfg: "TelegramConfig") -> SendMessage | None:
+    """返回一个发送单条 Telegram 消息并返回 message_id 的异步函数。
+
+    若 Telegram 未配置，返回 None。
+    """
+    if not cfg.enabled:
+        return None
+
+    bot_token = cfg.bot_token
+    chat_id = cfg.chat_id
+
+    async def send_message(text: str) -> int | None:
+        try:
+            return await _send_telegram_single(bot_token, chat_id, text)
+        except Exception as e:
+            logger.error("发送 Telegram 消息失败：%s", e)
+            return None
+
+    return send_message
+
+
+def make_poll_updates(cfg: "TelegramConfig") -> PollUpdates | None:
+    """返回一个通过 getUpdates 拉取 Telegram 消息的异步函数。
+
+    若 Telegram 未配置，返回 None。
+    返回的函数签名：async (offset: int) -> (updates: list[dict], new_offset: int)
+    """
+    if not cfg.enabled:
+        return None
+
+    bot_token = cfg.bot_token
+
+    async def poll_updates(offset: int) -> tuple[list[dict], int]:
+        try:
+            return await _poll_telegram_updates(bot_token, offset)
+        except Exception as e:
+            logger.error("拉取 Telegram 更新失败：%s", e)
+            return [], offset
+
+    return poll_updates
 
 
 def make_send_notice(cfg: "TelegramConfig") -> SendNotice | None:

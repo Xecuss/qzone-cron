@@ -11,7 +11,7 @@ import click
 
 from .config import load_config
 from .fetcher import feed_to_dict, fetch_feeds, setup_login
-from .notifier import make_qr_sender, make_send_notice
+from .notifier import make_poll_updates, make_qr_sender, make_send_message, make_send_notice
 from .plugin_loader import load_plugins, run_plugins
 from .state import State
 
@@ -141,6 +141,8 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         return
 
     send_notice = make_send_notice(config.telegram)
+    poll_updates = make_poll_updates(config.telegram)
+    send_message = make_send_message(config.telegram)
 
     plugin_context = {
         "uin": config.auth.uin,
@@ -148,6 +150,7 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
         "data_dir": config.storage.data_path,
         "plugins_config": config.plugins,
         "send_notice": send_notice,
+        "tg_send_message": send_message,
         "feed_store": state.feed_store,  # 与 state.feed_store 同一对象引用，后续更新自动可见
     }
 
@@ -301,6 +304,15 @@ async def _run(config_path: Path, plugins_dir: Path) -> None:
                 )
 
             state.save()
+
+    # 拉取 Telegram 更新，供插件拪取用户指令（如 reply 消息）
+    tg_updates: list[dict] = []
+    if poll_updates:
+        tg_updates, new_tg_offset = await poll_updates(state.tg_update_offset)
+        if new_tg_offset != state.tg_update_offset:
+            state.tg_update_offset = new_tg_offset
+            state.save()
+    plugin_context["tg_updates"] = tg_updates
 
     await run_plugins(plugins, feeds, updated_feeds=updated_feeds, context=plugin_context)
 
