@@ -19,6 +19,7 @@ daily_summary_plugin — 空间简报插件
     enabled = true
     summary_times = ["08:00", "20:00"]  # 每天推送时间点列表（本地时间，HH:MM）
     vip_uins = [12345678]               # 特别关注的 QQ 号列表（摘要中优先展示）
+    history_count = 3                   # 携带最近 N 次历史简报供大模型参考，0 表示不携带
 
     [plugins.daily_summary_plugin.openai]
     api_key = "sk-..."
@@ -92,9 +93,10 @@ def _load_state(state_file: Path) -> dict:
             )
         data.setdefault("pending_feed_ids", [])
         data.setdefault("image_desc_cache", {})
+        data.setdefault("summary_history", [])
         return data
     except Exception:
-        return {"last_check_time": None, "pending_feed_ids": [], "image_desc_cache": {}}
+        return {"last_check_time": None, "pending_feed_ids": [], "image_desc_cache": {}, "summary_history": []}
 
 
 def _save_state(state_file: Path, state: dict) -> None:
@@ -334,14 +336,25 @@ def _check_trigger(state: dict, summary_times: list[str], now: datetime) -> bool
 # ─── OpenAI compatible API call ───────────────────────────────────────────────
 
 
-async def _call_openai(cfg: dict, user_prompt: str, llm_chat: Any) -> str:
+async def _call_openai(
+    cfg: dict,
+    user_prompt: str,
+    llm_chat: Any,
+    previous_summaries: list[dict] | None = None,
+) -> str:
     system_prompt: str = cfg.get("system_prompt", "") or _DEFAULT_SYSTEM_PROMPT
+    if previous_summaries:
+        history_lines = ["\n\n---\n以下是近期已生成的历史简报，供你参考以保持内容连贯性，避免重复介绍相同事件：\n"]
+        for s in previous_summaries:
+            history_lines.append(f"【{s['time']}的简报】\n{s['content']}")
+        system_prompt = system_prompt + "\n\n".join(history_lines)
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
     return await llm_chat(
         cfg,
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages,
         timeout=60.0,
         temperature=0.7,
     )
@@ -361,11 +374,13 @@ async def _do_send(
     llm_chat: Any,
     *,
     force: bool = False,
+    history_count: int = 0,
 ) -> None:
     """生成摘要并通过全局 send_notice 发送，成功后清空队列并更新 last_check_time。
 
     force=True 时跳过时间检查（用于测试）。
     发送失败时不更新 last_check_time，下次运行会自动重试。
+    history_count > 0 时，将最近 N 条历史简报附加到 system prompt，以提升跨周期连贯性。
     """
     now = datetime.now()
 
@@ -409,8 +424,14 @@ async def _do_send(
     logger.info("开始生成空间简报，共 %d 条动态…", len(pending_records))
     user_prompt = _build_prompt(pending_records, now)
 
+    summary_history: list[dict] = state.setdefault("summary_history", [])
+    previous_summaries: list[dict] | None = None
+    if history_count > 0 and summary_history:
+        previous_summaries = summary_history[-history_count:]
+        logger.info("携带 %d 条历史简报供大模型参考。", len(previous_summaries))
+
     try:
-        summary = await _call_openai(openai_cfg, user_prompt, llm_chat)
+        summary = await _call_openai(openai_cfg, user_prompt, llm_chat, previous_summaries)
     except Exception as e:
         logger.error("调用 OpenAI API 失败：%s，队列保留，下次推送时间点自动重试。", e)
         # 不更新 last_check_time，下次运行仍会触发
@@ -444,11 +465,20 @@ async def _do_send(
     state["pending_feed_ids"] = []
     state.pop("_legacy_feed_data", None)
     state["last_check_time"] = now.isoformat()
+
+    # 将本次简报存入历史，并按 history_count 裁剪
+    summary_history = state.setdefault("summary_history", [])
+    summary_history.append({"time": date_str, "content": summary})
+    if history_count > 0:
+        state["summary_history"] = summary_history[-history_count:]
+    else:
+        state["summary_history"] = []
+
     logger.info("待摘要队列已清空。")
     _save_state(state_file, state)
 
 
-def _resolve_context(context: dict) -> tuple[dict, int | None, Path | None, dict, list[str], set[int]]:
+def _resolve_context(context: dict) -> tuple[dict, int | None, Path | None, dict, list[str], set[int], int]:
     plugins_config: dict = context.get("plugins_config", {})
     cfg: dict = plugins_config.get("daily_summary_plugin", {})
     owner_uin: int | None = context.get("uin")
@@ -457,7 +487,8 @@ def _resolve_context(context: dict) -> tuple[dict, int | None, Path | None, dict
     openai_cfg: dict = {**global_openai_cfg, **cfg.get("openai", {})}
     summary_times: list[str] = cfg.get("summary_times", ["08:00"])
     vip_uins: set[int] = set(cfg.get("vip_uins", []))
-    return cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins
+    history_count: int = max(0, int(cfg.get("history_count", 0)))
+    return cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins, history_count
 
 
 def _check_required(openai_cfg: dict, send_notice: Any) -> bool:
@@ -483,7 +514,7 @@ async def process(
 
     send_notice = context.get("send_notice")
     llm_chat: Any = context.get("llm_chat")
-    cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins = (
+    cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins, history_count = (
         _resolve_context(context)
     )
     if not owner_uin:
@@ -529,7 +560,8 @@ async def process(
 
     # ── 步骤 2：按时间决定是否发送 ───────────────────────────────────────────
     await _do_send(
-        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice, llm_chat
+        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice, llm_chat,
+        history_count=history_count,
     )
 
 
@@ -548,7 +580,7 @@ async def force_send(context: dict | None = None) -> None:
 
     send_notice = context.get("send_notice")
     llm_chat: Any = context.get("llm_chat")
-    cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins = (
+    cfg, owner_uin, data_dir, openai_cfg, summary_times, vip_uins, history_count = (
         _resolve_context(context)
     )
     if not owner_uin:
@@ -569,5 +601,6 @@ async def force_send(context: dict | None = None) -> None:
         "force_send: 队列中有 %d 条动态，立即生成简报…", len(state["pending_feed_ids"])
     )
     await _do_send(
-        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice, llm_chat, force=True
+        state, state_file, feed_store, openai_cfg, vip_uins, summary_times, send_notice, llm_chat,
+        force=True, history_count=history_count,
     )
