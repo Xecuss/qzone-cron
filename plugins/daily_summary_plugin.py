@@ -41,6 +41,80 @@ ENABLED = True
 
 logger = logging.getLogger(PLUGIN_NAME)
 
+
+# ─── Markdown → Telegram HTML ─────────────────────────────────────────────────
+
+
+def _md_to_tg_html(text: str) -> str:
+    """将 Markdown 文本转换为 Telegram 支持的 HTML 子集。
+
+    Telegram HTML 支持：<b>, <i>, <u>, <s>, <code>, <pre>, <a href>, <blockquote>。
+    不支持的结构（如标题）降级为加粗文本。
+    """
+    import mistune
+
+    class _TelegramRenderer(mistune.HTMLRenderer):
+        def heading(self, children: str, level: int, **attrs: Any) -> str:
+            return f"<b>{children}</b>\n\n"
+
+        def paragraph(self, children: str) -> str:
+            return f"{children}\n\n"
+
+        def emphasis(self, children: str) -> str:
+            return f"<i>{children}</i>"
+
+        def strong(self, children: str) -> str:
+            return f"<b>{children}</b>"
+
+        def codespan(self, code: str) -> str:
+            return f"<code>{html.escape(code)}</code>"
+
+        def block_code(self, code: str, info: str | None = None, **attrs: Any) -> str:
+            return f"<pre><code>{html.escape(code.rstrip())}</code></pre>\n\n"
+
+        def strikethrough(self, children: str) -> str:
+            return f"<s>{children}</s>"
+
+        def link(self, children: str, url: str, title: str | None = None) -> str:
+            safe_url = html.escape(url, quote=True)
+            return f'<a href="{safe_url}">{children}</a>'
+
+        def list(self, children: str, ordered: bool, **attrs: Any) -> str:
+            return f"{children}\n"
+
+        def list_item(self, children: str, **attrs: Any) -> str:
+            return f"• {children.strip()}\n"
+
+        def block_quote(self, children: str) -> str:
+            return f"<blockquote>{children.strip()}</blockquote>\n\n"
+
+        def hrule(self) -> str:
+            return "——\n\n"
+
+        def image(self, children: str, url: str, title: str | None = None) -> str:
+            # Telegram HTML 不支持内联图片，降级为链接
+            safe_url = html.escape(url, quote=True)
+            alt = children or title or "图片"
+            return f'<a href="{safe_url}">{html.escape(alt)}</a>'
+
+        def inline_html(self, html_text: str) -> str:  # type: ignore[override]
+            # 透传 Telegram 支持的标签，其他全部转义
+            _ALLOWED = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+                        "code", "pre", "a", "blockquote", "tg-spoiler"}
+            import re
+            tag_match = re.match(r"</?(\w[\w-]*)", html_text)
+            if tag_match and tag_match.group(1).lower() in _ALLOWED:
+                return html_text
+            return html.escape(html_text)
+
+    md = mistune.create_markdown(
+        renderer=_TelegramRenderer(escape=False),
+        plugins=["strikethrough"],
+    )
+    result = md(text)
+    return str(result).strip()
+
+
 _DEFAULT_SYSTEM_PROMPT = (
     "你是一位 QQ 空间简报助手。"
     "你将收到用户好友近期在 QQ 空间发布的说说原始数据，请生成一份简洁易读的空间简报。\n\n"
@@ -446,7 +520,7 @@ async def _do_send(
 
     message = (
         f"<b>📰 {html.escape(date_str)} QQ 空间简报</b>{vip_note}\n\n"
-        f"{html.escape(summary)}"
+        f"{_md_to_tg_html(summary)}"
     )
 
     try:

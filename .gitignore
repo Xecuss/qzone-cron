@@ -13,4 +13,3 @@ config.toml
 data
 cache
 qrcode.png
-uv.lock
