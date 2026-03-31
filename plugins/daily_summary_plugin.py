@@ -97,6 +97,9 @@ def _md_to_tg_html(text: str) -> str:
             alt = children or title or "图片"
             return f'<a href="{safe_url}">{html.escape(alt)}</a>'
 
+        def linebreak(self) -> str:
+            return "\n"
+
         def inline_html(self, html_text: str) -> str:  # type: ignore[override]
             # 透传 Telegram 支持的标签，其他全部转义
             _ALLOWED = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
@@ -107,12 +110,30 @@ def _md_to_tg_html(text: str) -> str:
                 return html_text
             return html.escape(html_text)
 
+        def block_html(self, html_text: str) -> str:  # type: ignore[override]
+            return self.inline_html(html_text) + "\n"
+
     md = mistune.create_markdown(
         renderer=_TelegramRenderer(escape=False),
         plugins=["strikethrough"],
     )
-    result = md(text)
-    return str(result).strip()
+    result = str(md(text)).strip()
+
+    # 兜底：清除所有非 Telegram 白名单的 HTML 标签
+    import re as _re
+    _TG_ALLOWED_TAGS = {
+        "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+        "code", "pre", "a", "blockquote", "tg-spoiler",
+    }
+
+    def _strip_unknown_tag(m: "_re.Match[str]") -> str:
+        tag = _re.match(r"</?(\w[\w-]*)", m.group(0))
+        if tag and tag.group(1).lower() in _TG_ALLOWED_TAGS:
+            return m.group(0)
+        return ""
+
+    result = _re.sub(r"<[^>]+>", _strip_unknown_tag, result)
+    return result
 
 
 _DEFAULT_SYSTEM_PROMPT = (
@@ -523,6 +544,7 @@ async def _do_send(
         f"{_md_to_tg_html(summary)}"
     )
 
+    logger.info("即将发送的 Telegram 消息内容：\n%s", message)
     try:
         await send_notice(message)
         logger.info("空间简报已成功发送到 Telegram。")
