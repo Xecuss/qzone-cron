@@ -58,16 +58,17 @@ _DEFAULT_SYSTEM_PROMPT = (
 
 def _load_state(state_file: Path) -> dict:
     if not state_file.exists():
-        return {"pending_items": [], "next_activation_time": None}
+        return {"pending_items": [], "next_activation_time": None, "is_active": False}
     try:
         with open(state_file, encoding="utf-8") as f:
             data = json.load(f)
         data.setdefault("pending_items", [])
         data.setdefault("next_activation_time", None)
+        data.setdefault("is_active", False)
         return data
     except Exception:
         logger.warning("读取状态文件 %s 失败，视为空状态。", state_file)
-        return {"pending_items": [], "next_activation_time": None}
+        return {"pending_items": [], "next_activation_time": None, "is_active": False}
 
 
 def _save_state(state_file: Path, state: dict) -> None:
@@ -227,6 +228,7 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
     global_openai_cfg: dict = context.get("global_openai_cfg") or {}
     openai_cfg: dict = {**global_openai_cfg, **plugin_cfg.get("openai", {})}
     llm_chat: Any = context.get("llm_chat")
+    send_notice = context.get("send_notice")
 
     if not owner_uin or not cookie_file:
         logger.warning("context 中缺少 uin 或 cookie_file，跳过自动点赞处理。")
@@ -278,14 +280,6 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
 
     # ── 步骤3：检查是否已到达激活时间 ──────────────────────────────────────
     now = time.time()
-    logger.info(
-        "[诊断] 队列长度=%d，next_activation_time=%s，now=%s，差值=%.1f 分钟",
-        len(state["pending_items"]),
-        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state["next_activation_time"]))
-        if state["next_activation_time"] else "None",
-        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-        (state["next_activation_time"] - now) / 60 if state["next_activation_time"] else float("nan"),
-    )
     if (
         state["pending_items"]
         and state["next_activation_time"] is not None
@@ -293,6 +287,15 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
     ):
         queue_len = len(state["pending_items"])
         logger.info("进入激活状态，队列中有 %d 条待点赞说说。", queue_len)
+        if not state.get("is_active"):
+            state["is_active"] = True
+            if send_notice:
+                try:
+                    await send_notice(
+                        f"自动点赞进入激活状态，队列中有 {queue_len} 条待点赞说说。"
+                    )
+                except Exception as e:
+                    logger.warning("发送激活通知失败：%s", e)
 
         batch = state["pending_items"][:likes_per_cycle]
         state["pending_items"] = state["pending_items"][likes_per_cycle:]
@@ -311,7 +314,18 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
         # ── 步骤4：队列清空后退出激活状态，预计算下一次激活时间 ──────────────
         if not state["pending_items"]:
             logger.info("点赞队列已清空，退出激活状态。")
+            state["is_active"] = False
             state["next_activation_time"] = _compute_next_activation(plugin_cfg)
+            if send_notice:
+                next_readable = time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(state["next_activation_time"])
+                )
+                try:
+                    await send_notice(
+                        f"自动点赞队列已清空，退出激活状态。\n下次激活时间：{next_readable}"
+                    )
+                except Exception as e:
+                    logger.warning("发送退出通知失败：%s", e)
         else:
             logger.info(
                 "队列仍剩余 %d 条，等待下次 cron 继续处理。", len(state["pending_items"])
