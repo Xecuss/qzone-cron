@@ -55,7 +55,7 @@ _DEFAULT_EDIT_METHOD = "comment"
 
 # 匹配 /like_to_show 10 或 /like_to_show 10 append 等写法
 _CMD_RE = re.compile(
-    r"/like_to_show\s+(\d+)(?:\s+(append|delete|comment|new))?(?:\s|$)",
+    r"/like_to_show\s+(\d+)(?:\s+(append|delete|comment|new)\b)?",
     re.IGNORECASE,
 )
 
@@ -64,7 +64,7 @@ _DELAY_STATE_FILENAME = "delay_to_show_state.json"
 # 匹配 /delay_to_show 30m 或 /delay_to_show 2h append 等写法
 # delay_time 支持：30m / 30min / 2h / 2hr / 2hours / 1d / 1day，纯数字默认小时
 _DELAY_CMD_RE = re.compile(
-    r"/delay_to_show\s+([\d.]+\s*(?:m(?:in)?|h(?:r|ours?)?|d(?:ays?)?)?)(?:\s+(append|delete|comment|new))?(?:\s|$)",
+    r"/delay_to_show\s+([\d.]+\s*(?:m(?:in)?|h(?:r|ours?)?|d(?:ays?)?)?)(?:\s+(append|delete|comment|new)\b)?",
     re.IGNORECASE,
 )
 
