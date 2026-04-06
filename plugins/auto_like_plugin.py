@@ -58,17 +58,40 @@ _DEFAULT_SYSTEM_PROMPT = (
 
 def _load_state(state_file: Path) -> dict:
     if not state_file.exists():
-        return {"pending_items": [], "next_activation_time": None, "is_active": False}
+        return {
+            "pending_items": [],
+            "dropped_items": [],
+            "next_activation_time": None,
+            "is_active": False,
+            "detail_msg_id": None,
+            "detail_uin": None,
+            "detail_mode": "like",
+            "detail_fid_list": [],
+        }
     try:
         with open(state_file, encoding="utf-8") as f:
             data = json.load(f)
         data.setdefault("pending_items", [])
+        data.setdefault("dropped_items", [])
         data.setdefault("next_activation_time", None)
         data.setdefault("is_active", False)
+        data.setdefault("detail_msg_id", None)
+        data.setdefault("detail_uin", None)
+        data.setdefault("detail_mode", "like")
+        data.setdefault("detail_fid_list", [])
         return data
     except Exception:
         logger.warning("读取状态文件 %s 失败，视为空状态。", state_file)
-        return {"pending_items": [], "next_activation_time": None, "is_active": False}
+        return {
+            "pending_items": [],
+            "dropped_items": [],
+            "next_activation_time": None,
+            "is_active": False,
+            "detail_msg_id": None,
+            "detail_uin": None,
+            "detail_mode": "like",
+            "detail_fid_list": [],
+        }
 
 
 def _save_state(state_file: Path, state: dict) -> None:
@@ -174,6 +197,185 @@ async def _should_like_feeds(feeds: list[Any], openai_cfg: dict, llm_chat: Any) 
         return {fid for f in feeds if (fid := getattr(f, "fid", None)) is not None}
 
 
+# ─── TG Command helpers ───────────────────────────────────────────────────────
+
+
+def _build_status_text(state: dict) -> str:
+    """构建 /qzone_autolike_status 总览文本（HTML 格式）。"""
+    import html as _html
+
+    pending = state.get("pending_items", [])
+    dropped = state.get("dropped_items", [])
+
+    nat = state.get("next_activation_time")
+    if nat:
+        nat_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(nat))
+    else:
+        nat_text = "未计划"
+
+    # 按用户聚合
+    user_like: dict[int, dict] = {}
+    user_drop: dict[int, dict] = {}
+
+    for item in pending:
+        uin = item.get("uin")
+        nick = item.get("nickname", str(uin))
+        if uin not in user_like:
+            user_like[uin] = {"nickname": nick, "count": 0}
+        user_like[uin]["count"] += 1
+
+    for item in dropped:
+        uin = item.get("uin")
+        nick = item.get("nickname", str(uin))
+        if uin not in user_drop:
+            user_drop[uin] = {"nickname": nick, "count": 0}
+        user_drop[uin]["count"] += 1
+
+    all_uins = sorted(set(user_like.keys()) | set(user_drop.keys()))
+
+    lines = [
+        "<b>自动点赞状态</b>",
+        f"下次激活时间：{nat_text}",
+        f"待点赞总数：{len(pending)} 条 / 已过滤（不点赞）：{len(dropped)} 条",
+        "",
+    ]
+
+    if all_uins:
+        lines.append("<b>按用户统计：</b>")
+        for uin in all_uins:
+            li = user_like.get(uin, {})
+            dr = user_drop.get(uin, {})
+            nick = li.get("nickname") or dr.get("nickname") or str(uin)
+            like_c = li.get("count", 0)
+            drop_c = dr.get("count", 0)
+            lines.append(
+                f"  {_html.escape(nick)}({uin})：待点赞 {like_c} / 不点赞 {drop_c}"
+            )
+    else:
+        lines.append("队列为空。")
+
+    lines.append("")
+    lines.append("使用 /qzone_autolike_status {uin} [like|drop] 查看某用户详情")
+    return "\n".join(lines)
+
+
+def _build_detail_text(state: dict, uin: int, mode: str, feed_store: dict) -> tuple[str, list[str]]:
+    """构建某用户的说说详情文本，返回 (text, fid_list（按展示顺序）)。"""
+    import html as _html
+
+    key = "pending_items" if mode == "like" else "dropped_items"
+    items = [item for item in state.get(key, []) if item.get("uin") == uin]
+    mode_label = "待点赞" if mode == "like" else "不点赞"
+
+    if not items:
+        return f"用户 {uin} 没有{mode_label}的说说。", []
+
+    nickname = items[0].get("nickname", str(uin))
+    lines = [f"<b>{_html.escape(nickname)}({uin}) 的{mode_label}说说：</b>"]
+    fid_list: list[str] = []
+    for i, item in enumerate(items, 1):
+        fid = item["fid"]
+        feed_dict = feed_store.get(fid) or {}
+        content = (feed_dict.get("content") or "（内容已超时移除）")[:100]
+        fid_list.append(fid)
+        lines.append(f"{i}. {_html.escape(content)}")
+
+    opposite_label = "不点赞" if mode == "like" else "加入点赞"
+    lines.append(f"\n回复消息编号可将对应说说切换为{opposite_label}状态。")
+    return "\n".join(lines), fid_list
+
+
+async def _handle_tg_commands(
+    state: dict,
+    tg_updates: list[dict],
+    tg_send_message: Any,
+    feed_store: dict,
+) -> None:
+    """处理 Telegram 消息：/qzone_autolike_status 命令和回复编号切换状态。"""
+    if not tg_send_message or not tg_updates:
+        return
+
+    for update in tg_updates:
+        msg = update.get("message") or {}
+        text: str = (msg.get("text") or "").strip()
+        if not text:
+            continue
+
+        # ── 检查是否是对详情消息的回复 ──────────────────────────────────────
+        reply_to = msg.get("reply_to_message") or {}
+        replied_id: int | None = reply_to.get("message_id")
+        if (
+            replied_id is not None
+            and replied_id == state.get("detail_msg_id")
+            and state.get("detail_fid_list")
+        ):
+            try:
+                idx = int(text.strip())
+            except ValueError:
+                pass
+            else:
+                fid_list: list[str] = state["detail_fid_list"]
+                if 1 <= idx <= len(fid_list):
+                    fid = fid_list[idx - 1]
+                    detail_mode: str = state.get("detail_mode", "like")
+                    src_key = "pending_items" if detail_mode == "like" else "dropped_items"
+                    dst_key = "dropped_items" if detail_mode == "like" else "pending_items"
+
+                    src_list: list[dict] = state[src_key]
+                    item = next((x for x in src_list if x["fid"] == fid), None)
+                    if item:
+                        state[src_key] = [x for x in src_list if x["fid"] != fid]
+                        state[dst_key].append(item)
+                        action = "移出点赞队列（不点赞）" if detail_mode == "like" else "加入点赞队列"
+                        nick = item.get("nickname", "?")
+                        await tg_send_message(
+                            f"✅ 已将条目 {idx}（{nick}）{action}。"
+                        )
+                        logger.info("用户操作：将 fid=%s %s。", fid, action)
+                    else:
+                        await tg_send_message(f"⚠️ 未找到编号 {idx} 对应的说说（可能已处理）。")
+            continue  # 无论是否匹配编号，回复消息不再当作命令解析
+
+        # ── 检查是否是命令 ────────────────────────────────────────────────────
+        if not text.startswith("/qzone_autolike_status"):
+            continue
+
+        parts = text.split()
+
+        if len(parts) == 1:
+            # 总览
+            status_text = _build_status_text(state)
+            await tg_send_message(status_text)
+
+        elif len(parts) >= 2:
+            try:
+                target_uin = int(parts[1])
+            except ValueError:
+                await tg_send_message("❌ 参数格式错误：uin 必须为数字。")
+                continue
+
+            mode = "like"
+            if len(parts) >= 3:
+                if parts[2].lower() in ("drop", "like"):
+                    mode = parts[2].lower()
+                else:
+                    await tg_send_message("❌ 第二个参数必须为 like 或 drop。")
+                    continue
+
+            detail_text, fid_list = _build_detail_text(state, target_uin, mode, feed_store)
+            msg_id = await tg_send_message(detail_text)
+
+            if msg_id and fid_list:
+                state["detail_msg_id"] = msg_id
+                state["detail_uin"] = target_uin
+                state["detail_mode"] = mode
+                state["detail_fid_list"] = fid_list
+                logger.info(
+                    "已发送 %s 详情（uin=%d，%d 条），msg_id=%d。",
+                    mode, target_uin, len(fid_list), msg_id,
+                )
+
+
 # ─── Like API ─────────────────────────────────────────────────────────────────
 
 
@@ -229,6 +431,8 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
     openai_cfg: dict = {**global_openai_cfg, **plugin_cfg.get("openai", {})}
     llm_chat: Any = context.get("llm_chat")
     send_notice = context.get("send_notice")
+    tg_send_message: Any = context.get("tg_send_message")
+    tg_updates: list[dict] = context.get("tg_updates") or []
 
     if not owner_uin or not cookie_file:
         logger.warning("context 中缺少 uin 或 cookie_file，跳过自动点赞处理。")
@@ -254,25 +458,38 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
         should_like_fids = await _should_like_feeds(friend_feeds, openai_cfg, llm_chat)
         existing_fids = {item["fid"] for item in state["pending_items"]}
 
+        existing_dropped_fids = {item["fid"] for item in state["dropped_items"]}
+
         new_items: list[dict] = []
+        new_dropped: list[dict] = []
         for feed in friend_feeds:
             fid = getattr(feed, "fid", None)
-            if not fid or fid not in should_like_fids or fid in existing_fids:
+            if not fid:
                 continue
-            new_items.append({
+            item_dict = {
                 "fid": fid,
                 "uin": feed.userinfo.uin,
                 "nickname": feed.userinfo.nickname or str(feed.userinfo.uin),
                 "appid": feed.common.appid,
                 "unikey": feed.topicId,
                 "curkey": str(feed.common.curkey),
-            })
-            existing_fids.add(fid)
+            }
+            if fid in should_like_fids:
+                if fid not in existing_fids:
+                    new_items.append(item_dict)
+                    existing_fids.add(fid)
+            else:
+                if fid not in existing_fids and fid not in existing_dropped_fids:
+                    new_dropped.append(item_dict)
+                    existing_dropped_fids.add(fid)
 
         if new_items:
             # 新说说插到队列头部，保证从最新的开始点赞（类似人看到新内容先点赞）
             state["pending_items"] = new_items + state["pending_items"]
             logger.info("新增 %d 条待点赞说说，队列共 %d 条。", len(new_items), len(state["pending_items"]))
+        if new_dropped:
+            state["dropped_items"] = new_dropped + state["dropped_items"]
+            logger.info("新增 %d 条已过滤（不点赞）说说，共 %d 条。", len(new_dropped), len(state["dropped_items"]))
 
     # ── 步骤2：若队列非空且尚未预计算激活时间，则计算激活时间 ───────────────
     if state["pending_items"] and state["next_activation_time"] is None:
@@ -338,5 +555,9 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
             len(state["pending_items"]),
             remaining_min,
         )
+
+    # ── 步骤5：处理 Telegram 命令（状态查询 / 切换点赞）───────────────────────
+    feed_store: dict = context.get("feed_store") or {}
+    await _handle_tg_commands(state, tg_updates, tg_send_message, feed_store)
 
     _save_state(state_file, state)
