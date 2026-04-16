@@ -35,6 +35,16 @@ SendMessage = Callable[[str], Awaitable["int | None"]]
 PollUpdates = Callable[[int], Awaitable["tuple[list[dict], int]"]]
 
 
+async def poll_updates_raw(bot_token: str, offset: int, long_poll_timeout: int = 30) -> tuple[list[dict], int]:
+    """公开的长轮询接口，供 setup-tg 等命令直接调用。"""
+    return await _poll_telegram_updates(bot_token, offset, long_poll_timeout)
+
+
+async def send_message_raw(bot_token: str, chat_id: str, text: str) -> None:
+    """向指定 chat_id 发送消息，供 setup-tg 等命令直接调用。"""
+    await _send_telegram(bot_token, chat_id, text)
+
+
 async def _send_telegram(bot_token: str, chat_id: str, text: str) -> None:
     """向指定 Telegram 会话发送消息（自动按 4096 字分块）。
 
@@ -72,13 +82,19 @@ async def _send_telegram_single(bot_token: str, chat_id: str, text: str) -> int:
         return int(resp.json()["result"]["message_id"])
 
 
-async def _poll_telegram_updates(bot_token: str, offset: int) -> tuple[list[dict], int]:
-    """调用 getUpdates 拉取从 offset 开始的新消息，返回 (updates, new_offset)。"""
+async def _poll_telegram_updates(
+    bot_token: str, offset: int, long_poll_timeout: int = 0
+) -> tuple[list[dict], int]:
+    """调用 getUpdates 拉取从 offset 开始的新消息，返回 (updates, new_offset)。
+
+    long_poll_timeout > 0 时启用长轮询（秒），HTTP 超时自动加 5 秒余量。
+    """
     import httpx
 
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
-    params: dict = {"offset": offset, "timeout": 0, "allowed_updates": ["message"]}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    params: dict = {"offset": offset, "timeout": long_poll_timeout, "allowed_updates": ["message"]}
+    http_timeout = max(30.0, long_poll_timeout + 5.0)
+    async with httpx.AsyncClient(timeout=http_timeout) as client:
         resp = await client.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()

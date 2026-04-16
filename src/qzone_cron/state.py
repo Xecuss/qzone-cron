@@ -64,6 +64,15 @@ class State:
     def tg_update_offset(self, value: int) -> None:
         self._data["tg_update_offset"] = value
 
+    @property
+    def tg_chat_id(self) -> str:
+        """通过 setup-tg 命令绑定的 Telegram 会话 ID，优先于配置文件中的 chat_id。"""
+        return str(self._data.get("tg_chat_id", ""))
+
+    @tg_chat_id.setter
+    def tg_chat_id(self, value: str) -> None:
+        self._data["tg_chat_id"] = value
+
     def expire_feeds(self, retention_hours: float) -> int:
         """清除早于 retention_hours 的 feed，返回被清除的条数。"""
         cutoff = _time.time() - retention_hours * 3600
