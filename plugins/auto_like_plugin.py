@@ -530,8 +530,9 @@ async def process(feeds: list[Any], context: dict | None = None) -> None:
 
         # ── 步骤4：队列清空后退出激活状态，预计算下一次激活时间 ──────────────
         if not state["pending_items"]:
-            logger.info("点赞队列已清空，退出激活状态。")
+            logger.info("点赞队列已清空，退出激活状态，同时清空不点赞列表。")
             state["is_active"] = False
+            state["dropped_items"] = []
             state["next_activation_time"] = _compute_next_activation(plugin_cfg)
             if send_notice:
                 next_readable = time.strftime(
