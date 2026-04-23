@@ -78,17 +78,122 @@ crontab -e
 
 ## 命令行选项
 
-```
-qzone-cron setup        [-c config.toml] [-v]
-qzone-cron run          [-c config.toml] [-p plugins/] [-v]
-qzone-cron send-summary [-c config.toml] [-p plugins/] [-v]
+### setup — 交互式登录
+
+```bash
+uv run qzone-cron setup [-c config.toml] [-v]
 ```
 
-`send-summary` — 忽略 `summary_times` 时间限制，立即用队列中已有的说说生成简报并发送，主要用于测试。若队列为空，可先执行一次 `qzone-cron run` 抓取说说再调用。
+首次使用或 Cookie 过期时执行。扫描二维码完成登录，Cookie 自动保存至数据目录。
+
+### setup-tg — Telegram 会话绑定
+
+```bash
+uv run qzone-cron setup-tg [-c config.toml] [--timeout 300] [-v]
+```
+
+绑定 Telegram 会话以接收通知。流程：
+1. 生成随机 6 位 PIN 码并显示在终端
+2. 向 Bot 发送消息：`/qz <PIN>`
+3. 会话 ID 自动保存，后续通知优先使用此会话
+
+参数：
+- `--timeout` — 等待验证的超时时间（秒），默认 300 秒
+
+### run — 抓取说说并处理
+
+```bash
+uv run qzone-cron run [-c config.toml] [-p plugins/] [-v]
+```
+
+抓取 QQ 空间新说说并分发给各插件处理。通常由 crontab 定期调用：
+
+```bash
+*/15 * * * * cd /path/to/qzone-cron && uv run qzone-cron run >> /var/log/qzone-cron.log 2>&1
+```
+
+### send-summary — 立即发送简报
+
+```bash
+uv run qzone-cron send-summary [-c config.toml] [-p plugins/] [-v]
+```
+
+强制立即生成并发送 `daily_summary_plugin` 的简报（测试用）。忽略 `summary_hour` 时间限制，使用队列中已有的说说生成摘要。若队列为空，可先执行一次 `run` 命令抓取说说。
+
+### dump — 导出全部说说
+
+```bash
+uv run qzone-cron dump [-c config.toml] [-o out.jsonl] [--since <timestamp>] [--max-pages N] [--continue] [-v]
+```
+
+抓取自己的全部说说并保存到 JSON Lines 格式文件（每行一条说说），包含正文、图片、点赞数、全部评论等。每抓取一页就实时写入文件，中断后可用 `--continue` 续传。
+
+参数：
+- `-o` / `--output` — 输出文件路径，默认为 `<data_dir>/my_feeds.jsonl`
+- `--since` — 仅抓取晚于此 Unix 时间戳的说说，0 表示全部（默认）
+- `--max-pages` — 最大翻页数，0 表示不限制（默认）
+- `--continue` — 断点续传，读取已有输出文件中的 fid，跳过已写条目
+
+示例：
+```bash
+uv run qzone-cron dump                       # 抓取全部，保存到 data/my_feeds.jsonl
+uv run qzone-cron dump -o out.jsonl          # 指定输出路径
+uv run qzone-cron dump --max-pages 5         # 仅抓取前 5 页
+uv run qzone-cron dump --continue            # 断点续传
+```
+
+### to-markdown — 转换为 Markdown 格式
+
+```bash
+uv run qzone-cron to-markdown [-c config.toml] [-i input.jsonl] [-o output.md] [--no-vision]
+```
+
+将已导出的说说 JSONL 文件转换为 Markdown 格式，便于发给大模型分析或离线阅读。对包含图片的说说，使用多模态模型自动描述图片内容（需配置 `[openai]`）。
+
+参数：
+- `-i` / `--input` — 输入 JSONL 文件路径，默认为 `<data_dir>/my_feeds.jsonl`
+- `-o` / `--output` — 输出 Markdown 文件路径，默认为 `<data_dir>/my_feeds.md`
+- `--cache` — 图片描述缓存文件路径（JSON），默认为 `<data_dir>/img_desc_cache.json`
+- `--vision-model` — 用于描述图片的多模态模型名称（覆盖配置文件中的 `openai.model`）
+- `--no-vision` — 跳过图片描述，仅输出文字内容和图片 URL
+
+特性：
+- 自动按时间升序排列说说
+- 支持图片描述缓存，重新运行时自动跳过已处理条目
+- 包含说说的正文、转发、分享链接、评论等完整内容
+- 输出的 Markdown 包含统计信息（说说数、导出时间等）
+
+示例：
+```bash
+uv run qzone-cron to-markdown                          # 使用默认路径，自动描述图片
+uv run qzone-cron to-markdown --no-vision              # 跳过图片描述
+uv run qzone-cron to-markdown --vision-model gpt-4o    # 指定视觉模型
+uv run qzone-cron to-markdown -i data/feeds.jsonl -o output.md
+```
 
 ## 全局配置
 
 `config.toml` 中有四个顶层配置块，影响主流程行为。
+
+### Telegram 会话绑定
+
+如需接收通知，需执行 `setup-tg` 命令绑定 Telegram 会话：
+
+```bash
+uv run qzone-cron setup-tg
+```
+
+流程说明：
+1. **生成 PIN 码**：命令会生成随机 6 位数字 PIN 码并显示在终端
+2. **用户验证**：用户在 Telegram 中向 Bot 发送 `/qz <PIN>` 完成验证
+3. **保存会话**：验证成功后，会话 ID（chat_id）自动保存到状态文件
+
+验证通过后，后续所有通知（包括登录二维码、插件消息等）都会优先发送到此会话。若未绑定会话，通知会发送到 `config.toml` 中配置的 `[telegram]` 的默认 `chat_id`。
+
+可选：修改超时时间（默认 300 秒）：
+```bash
+uv run qzone-cron setup-tg --timeout 600
+```
 
 ### `[auth]` — 账号与登录
 

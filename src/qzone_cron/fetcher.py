@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,72 @@ def feed_to_dict(feed: Any) -> dict:
         "share_title": share_title,
         "share_summary": share_summary,
     }
+
+
+def feed_to_rich_dict(feed: Any) -> dict:
+    """将 aioqzone feed 对象序列化为包含尽可能完整信息的字典，用于离线分析。
+
+    与 feed_to_dict 的区别：
+      - 包含 ALL 评论（不限于前 3 条），含评论时间、点赞数、回复数
+      - 包含评论回复内容
+      - 包含访问/查看次数（visitor / view_count）
+      - 包含 curkey / orgkey / ugckey / subid 等 feed 标识字段
+    """
+    base = feed_to_dict(feed)
+
+    # ── 完整评论列表 ──────────────────────────────────────────────
+    all_comments: list[dict] = []
+    if feed.comment and feed.comment.comments:
+        for c in feed.comment.comments:
+            replies: list[dict] = []
+            if getattr(c, "replys", None):
+                for r in c.replys:
+                    replies.append({
+                        "uin": r.user.uin if hasattr(r, "user") else None,
+                        "nickname": (r.user.nickname or str(r.user.uin)) if hasattr(r, "user") else None,
+                        "content": getattr(r, "content", ""),
+                        "date": getattr(r, "date", None),
+                    })
+            all_comments.append({
+                "commentid": c.commentid,
+                "uin": c.user.uin,
+                "nickname": c.user.nickname or str(c.user.uin),
+                "content": c.content,
+                "date": c.date,
+                "like_count": c.likeNum,
+                "is_liked": c.isliked,
+                "reply_count": c.replynum,
+                "is_deleted": c.isDeleted,
+                "is_private": c.isPrivate,
+                "replies": replies,
+            })
+    base["all_comments"] = all_comments
+
+    # ── 访客 / 浏览次数 ───────────────────────────────────────────
+    visitor_count: int | None = None
+    view_count: int | None = None
+    if feed.visitor is not None:
+        visitor_count = getattr(feed.visitor, "visitor_count", None)
+        view_count = getattr(feed.visitor, "view_count", None)
+    base["visitor_count"] = visitor_count
+    base["view_count"] = view_count
+
+    # ── Feed 标识键（用于后续互动 API 调用）────────────────────────
+    # curkey / orgkey / ugckey 可能是 pydantic HttpUrl 对象，需转为字符串
+    def _to_str(v: Any) -> str | None:
+        return str(v) if v is not None else None
+
+    base["curkey"] = _to_str(feed.common.curkey) if feed.common else None
+    base["orgkey"] = _to_str(feed.common.orgkey) if feed.common else None
+    base["ugckey"] = _to_str(feed.common.ugckey) if feed.common else None
+    base["subid"] = feed.common.subid if feed.common else None
+
+    # 覆盖 top_comments，改用 all_comments 中的前 3 条摘要（保持向后兼容）
+    base["top_comments"] = [
+        {"user": c["nickname"], "content": c["content"]} for c in all_comments[:3]
+    ]
+
+    return base
 
 
 def load_cookies(cookie_file: Path) -> dict[str, str] | None:
@@ -251,3 +319,101 @@ async def fetch_feeds(
 
         logger.info("共抓取到 %d 条新说说（%d 页）。", len(feeds), page + 1)
         return feeds
+
+
+async def iter_self_feeds(
+    uin: int,
+    cookie_file: Path,
+    since_time: float = 0.0,
+    max_pages: int = 0,
+) -> AsyncGenerator[tuple[int, list[Any]], None]:
+    """异步生成器：每翻一页就 yield (page_num, feeds_in_this_page)，
+    供调用方逐页处理（如实时写文件），无需等待全部抓取完成。
+
+    :param uin: 自己的 QQ 号。
+    :param cookie_file: 已保存 Cookie 的路径。
+    :param since_time: 遇到不晚于此时间戳的说说时停止翻页；0 表示不限制。
+    :param max_pages: 最大翻页数；0 表示不限制。
+    """
+    from aioqzone.api import QzoneH5API
+    from aioqzone.api.login import ConstLoginMan
+    from qqqr.utils.net import ClientAdapter, use_mobile_ua
+
+    cookies = load_cookies(cookie_file)
+    if not cookies:
+        raise RuntimeError(
+            "未找到 Cookie 文件，请先执行 'qzone-cron setup' 进行登录。"
+        )
+
+    async with ClientAdapter() as client:
+        use_mobile_ua(client)
+        login_man = ConstLoginMan(uin=uin, cookie=cookies)
+        api = QzoneH5API(client, login_man)
+
+        attach_info: str | None = None
+        page = 0
+
+        while True:
+            try:
+                resp = await api.get_feeds(hostuin=uin, attach_info=attach_info)
+            except Exception as e:
+                from tenacity import RetryError
+                cause = e.last_attempt.exception() if isinstance(e, RetryError) else e
+                from aioqzone.exception import QzoneError
+                if isinstance(cause, QzoneError) and cause.code == -3000:
+                    raise RuntimeError(
+                        "QQ空间返回「系统繁忙」（code=-3000），Cookie 已失效，需要重新登录。"
+                    ) from e
+                raise
+
+            page_feeds: list[Any] = []
+            stop = False
+            for feed in resp.vFeeds:
+                feed_time: int = feed.common.time
+                if since_time > 0 and feed_time <= since_time:
+                    stop = True
+                    break
+                page_feeds.append(feed)
+
+            yield page, page_feeds
+
+            has_more: bool = resp.hasmore
+            attach_info = resp.attachinfo
+            page += 1
+
+            if stop or not has_more:
+                break
+            if max_pages > 0 and page >= max_pages:
+                logger.warning("已达到最大翻页数（%d），停止抓取。", max_pages)
+                break
+
+            # 每翻一页随机等待 1~3 秒，降低被频控的风险
+            delay = random.uniform(1.0, 3.0)
+            logger.debug("翻页间隔 %.1f 秒…", delay)
+            await asyncio.sleep(delay)
+
+
+async def fetch_self_feeds(
+    uin: int,
+    cookie_file: Path,
+    since_time: float = 0.0,
+    max_pages: int = 0,
+    progress_cb: Any = None,
+) -> list[Any]:
+    """抓取自己空间主页的全部说说（使用 profile/get_feeds 接口）。
+
+    :param uin: 自己的 QQ 号。
+    :param cookie_file: 已保存 Cookie 的路径。
+    :param since_time: 仅返回晚于此时间戳的说说；0 表示不限制（抓取全部）。
+    :param max_pages: 最大翻页数；0 表示不限制（抓取全部）。
+    :param progress_cb: 可选回调 ``(page, fetched_count)``，每翻一页调用一次。
+    :return: 按时间倒序排列的 feed 对象列表（最新的在前）。
+    """
+    feeds: list[Any] = []
+    async for page, page_feeds in iter_self_feeds(uin, cookie_file, since_time, max_pages):
+        feeds.extend(page_feeds)
+        if progress_cb is not None:
+            progress_cb(page, len(feeds))
+    logger.info("共抓取到自己的 %d 条说说。", len(feeds))
+    return feeds
+

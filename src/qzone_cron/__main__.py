@@ -10,7 +10,7 @@ from pathlib import Path
 import click
 
 from .config import load_config
-from .fetcher import feed_to_dict, fetch_feeds, setup_login
+from .fetcher import feed_to_dict, feed_to_rich_dict, fetch_feeds, fetch_self_feeds, iter_self_feeds, setup_login
 from .llm import chat_completion
 from .notifier import make_poll_updates, make_qr_sender, make_send_message, make_send_notice, poll_updates_raw, send_message_raw
 from .plugin_loader import load_plugins, run_plugins
@@ -503,6 +503,449 @@ async def _send_summary(config_path: Path, plugins_dir: Path) -> None:
         "feed_store": state.feed_store,
     }
     await mod.force_send(context=plugin_context)
+
+
+@cli.command("dump")
+@click.option(
+    "-c",
+    "--config",
+    "config_path",
+    default=str(DEFAULT_CONFIG),
+    show_default=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="配置文件路径（TOML 格式）。",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="输出文件路径（JSON Lines 格式）。默认为 <data_dir>/my_feeds.jsonl。",
+)
+@click.option(
+    "--since",
+    "since_time",
+    default=0.0,
+    type=float,
+    help="仅抓取晚于此 Unix 时间戳的说说。0 表示抓取全部（默认）。",
+)
+@click.option(
+    "--max-pages",
+    "max_pages",
+    default=0,
+    type=int,
+    show_default=True,
+    help="最大翻页数。0 表示不限制（抓取全部）。",
+)
+@click.option(
+    "--continue", "resume",
+    is_flag=True,
+    help="断点续传：读取已有输出文件中的 fid，跳过已写条目，将新条目追加到文件末尾。",
+)
+@click.option("-v", "--verbose", is_flag=True, help="输出详细日志。")
+def dump(config_path: Path, output_path: Path | None, since_time: float, max_pages: int, resume: bool, verbose: bool) -> None:
+    """抓取自己所有的说说并保存到文件，用于离线分析。
+
+    输出格式为 JSON Lines（每行一条说说），包含说说的全量信息：
+    正文、图片、点赞数、全部评论（含回复）、访问次数等。
+    每吸取一页就实时写入文件，中断后可用 --continue 继续。
+
+    \b
+    示例：
+      uv run qzone-cron dump                       # 抓取全部，保存到 data/my_feeds.jsonl
+      uv run qzone-cron dump -o out.jsonl          # 指定输出路径
+      uv run qzone-cron dump --max-pages 5         # 仅抓取前 5 页
+      uv run qzone-cron dump --continue            # 断点续传
+    """
+    _setup_logging(verbose)
+    asyncio.run(_dump(config_path, output_path, since_time, max_pages, resume))
+
+
+async def _dump(config_path: Path, output_path: Path | None, since_time: float, max_pages: int, resume: bool) -> None:
+    import json as _json
+
+    logger = logging.getLogger(__name__)
+    config = load_config(config_path)
+
+    if output_path is None:
+        output_path = config.storage.data_path / "my_feeds.jsonl"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 断点续传：加载已有的 fid 集合（仅 resume 模式）
+    resume_fids: set[str] = set()  # 来自已有文件，用于 --continue 时跳过
+    seen_fids: set[str] = set()    # 本次运行内去重，避免 API 跨页返回重复条目
+    if resume and output_path.exists():
+        with open(output_path, encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line:
+                    try:
+                        _fid = _json.loads(_line).get("fid")
+                        if _fid:
+                            resume_fids.add(_fid)
+                    except Exception:
+                        pass
+        click.echo(f"已加载 {len(resume_fids)} 条已有说说，将跳过重复项并追加新内容。")
+    elif resume:
+        click.echo("输出文件不存在，以全量模式启动。")
+
+    file_mode = "a" if resume and output_path.exists() else "w"
+    total_written = 0
+    total_skipped = 0
+
+    logger.info(
+        "开始抓取 UIN=%d 的全部说说（max_pages=%s，since=%s，resume=%s）…",
+        config.auth.uin,
+        max_pages if max_pages > 0 else "不限",
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since_time)) if since_time > 0 else "不限",
+        resume,
+    )
+
+    try:
+        with open(output_path, file_mode, encoding="utf-8") as f:
+            async for page_num, page_feeds in iter_self_feeds(
+                uin=config.auth.uin,
+                cookie_file=config.storage.cookie_file,
+                since_time=since_time,
+                max_pages=max_pages,
+            ):
+                for feed in page_feeds:
+                    fid = getattr(feed, "fid", None)
+                    # --continue 模式：跳过已写入文件的条目
+                    if fid and fid in resume_fids:
+                        total_skipped += 1
+                        continue
+                    # 本次运行内去重（API 可能跨页返回重复条目）
+                    if fid and fid in seen_fids:
+                        continue
+                    try:
+                        record = feed_to_rich_dict(feed)
+                    except Exception as exc:
+                        logger.warning("序列化说说 %s 失败，降级为基础格式：%s", fid or "?", exc)
+                        try:
+                            record = feed_to_dict(feed)
+                        except Exception:
+                            continue
+                    f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+                    f.flush()
+                    total_written += 1
+                    if fid:
+                        seen_fids.add(fid)
+
+                click.echo(
+                    f"\r  第 {page_num + 1} 页，已写入 {total_written} 条"
+                    + (f"（跳过 {total_skipped} 条）" if total_skipped else "")
+                    + "…",
+                    nl=False,
+                )
+    except RuntimeError as e:
+        click.echo()  # 换行
+        logger.error("%s", e)
+        sys.exit(1)
+
+    click.echo()  # 换行
+    summary = f"完成：共写入 {total_written} 条说说至 {output_path}"
+    if total_skipped:
+        summary += f"（跳过已有 {total_skipped} 条）"
+    click.echo(summary)
+
+
+@cli.command("to-markdown")
+@click.option(
+    "-c",
+    "--config",
+    "config_path",
+    default=str(DEFAULT_CONFIG),
+    show_default=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="配置文件路径（TOML 格式）。",
+)
+@click.option(
+    "-i",
+    "--input",
+    "input_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="输入 JSONL 文件路径。默认为 <data_dir>/my_feeds.jsonl。",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="输出 Markdown 文件路径。默认为 <data_dir>/my_feeds.md。",
+)
+@click.option(
+    "--cache",
+    "cache_path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="图片描述缓存文件路径（JSON）。默认为 <data_dir>/img_desc_cache.json。",
+)
+@click.option(
+    "--vision-model",
+    "vision_model",
+    default=None,
+    help="用于描述图片的多模态模型名称（覆盖配置文件中的 openai.model）。",
+)
+@click.option(
+    "--no-vision",
+    "no_vision",
+    is_flag=True,
+    help="跳过图片描述，仅输出文字内容和图片 URL。",
+)
+@click.option("-v", "--verbose", is_flag=True, help="输出详细日志。")
+def to_markdown(
+    config_path: Path,
+    input_path: Path | None,
+    output_path: Path | None,
+    cache_path: Path | None,
+    vision_model: str | None,
+    no_vision: bool,
+    verbose: bool,
+) -> None:
+    """将已爬取的说说 JSONL 转换为 Markdown 格式，便于发给大模型分析。
+
+    对包含图片的说说，使用多模态模型自动描述图片内容（需配置 [openai]）。
+    图片描述结果会缓存到本地，重新运行时自动跳过已处理的条目。
+
+    \b
+    示例：
+      uv run qzone-cron to-markdown                          # 使用默认路径
+      uv run qzone-cron to-markdown --no-vision              # 跳过图片描述
+      uv run qzone-cron to-markdown --vision-model gpt-4o    # 指定视觉模型
+    """
+    _setup_logging(verbose)
+    asyncio.run(_to_markdown(config_path, input_path, output_path, cache_path, vision_model, no_vision))
+
+
+async def _to_markdown(
+    config_path: Path,
+    input_path: Path | None,
+    output_path: Path | None,
+    cache_path: Path | None,
+    vision_model: str | None,
+    no_vision: bool,
+) -> None:
+    import json as _json
+
+    logger = logging.getLogger(__name__)
+    config = load_config(config_path)
+
+    if input_path is None:
+        input_path = config.storage.data_path / "my_feeds.jsonl"
+    if output_path is None:
+        output_path = config.storage.data_path / "my_feeds.md"
+    if cache_path is None:
+        cache_path = config.storage.data_path / "img_desc_cache.json"
+
+    if not input_path.exists():
+        logger.error("输入文件不存在：%s", input_path)
+        sys.exit(1)
+
+    # 加载全部说说
+    entries: list[dict] = []
+    with open(input_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(_json.loads(line))
+                except Exception:
+                    pass
+    click.echo(f"已加载 {len(entries)} 条说说。")
+
+    # 按时间升序排列（从最早到最新）
+    entries.sort(key=lambda e: e.get("time", 0))
+
+    # 加载图片描述缓存
+    img_cache: dict[str, str] = {}
+    if cache_path.exists():
+        try:
+            raw_cache = _json.loads(cache_path.read_text(encoding="utf-8"))
+            # 兼容旧格式（list[str]）：合并为单字符串
+            img_cache = {
+                k: (" ".join(v).strip() if isinstance(v, list) else v)
+                for k, v in raw_cache.items()
+            }
+        except Exception:
+            img_cache = {}
+        click.echo(f"已加载图片描述缓存（{len(img_cache)} 条）。")
+
+    # 构建 LLM 配置（视觉模型）
+    openai_cfg = config.openai.as_dict()
+    if vision_model:
+        openai_cfg["model"] = vision_model
+
+    # 处理图片描述
+    if not no_vision:
+        need_vision = [e for e in entries if e.get("has_images") and e.get("image_urls") and e["fid"] not in img_cache]
+        if need_vision:
+            click.echo(f"需要描述图片的说说：{len(need_vision)} 条，开始处理…")
+        for idx, entry in enumerate(need_vision, 1):
+            fid = entry["fid"]
+            image_urls: list[str] = entry.get("image_urls", [])
+            content_text: str = entry.get("content", "")
+            click.echo(f"\r  [{idx}/{len(need_vision)}] 描述图片中…", nl=False)
+            try:
+                description = await _describe_images(openai_cfg, content_text, image_urls)
+                img_cache[fid] = description
+            except Exception as exc:
+                logger.warning("描述图片失败（fid=%s）：%s", fid, exc)
+                img_cache[fid] = f"[图片描述失败：{exc}]"
+            # 每条处理完后立即保存缓存
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(_json.dumps(img_cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        if need_vision:
+            click.echo()  # 换行
+
+    # 渲染 Markdown
+    lines: list[str] = []
+    lines.append("# 我的 QQ 空间说说\n")
+    lines.append(f"> 共 {len(entries)} 条，导出时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    lines.append("---\n")
+
+    for entry in entries:
+        lines.append(_entry_to_markdown(entry, img_cache, no_vision))
+
+    md_text = "\n".join(lines)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(md_text, encoding="utf-8")
+    click.echo(f"已生成 Markdown 文件：{output_path}（{len(entries)} 条说说）")
+
+
+async def _fetch_image_as_data_uri(url: str) -> str:
+    """下载图片并转换为 base64 data URI，失败时返回原 URL。"""
+    import base64 as _b64
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"Referer": "https://user.qzone.qq.com/"})
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            if not content_type.startswith("image/"):
+                content_type = "image/jpeg"
+            b64 = _b64.b64encode(resp.content).decode()
+            return f"data:{content_type};base64,{b64}"
+    except Exception:
+        return url  # 降级：直接用 URL
+
+
+async def _describe_images(cfg: dict, content_text: str, image_urls: list[str]) -> str:
+    """下载图片后以 base64 data URI 发给多模态 LLM，返回整体描述字符串。"""
+    content_parts: list[dict] = []
+
+    prompt = "请描述以下图片的内容，稍微详细一些。"
+    if content_text:
+        prompt += f"\n\n说说正文（供参考上下文）：{content_text}"
+
+    content_parts.append({"type": "text", "text": prompt})
+
+    # 并发下载所有图片
+    data_uris = await asyncio.gather(*[_fetch_image_as_data_uri(u) for u in image_urls])
+    for data_uri in data_uris:
+        content_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+
+    response = await chat_completion(
+        cfg=cfg,
+        messages=[{"role": "user", "content": content_parts}],
+        timeout=60.0,
+        max_tokens=1000,
+    )
+    return response.strip()
+
+
+def _entry_to_markdown(entry: dict, img_cache: dict[str, str], no_vision: bool) -> str:
+    """将单条说说转换为 Markdown 字符串。"""
+    import datetime as _dt
+
+    fid = entry.get("fid", "")
+    ts = entry.get("time", 0)
+    dt_str = _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "未知时间"
+    content = (entry.get("content") or "").strip()
+    image_urls: list[str] = entry.get("image_urls", [])
+    like_count: int = entry.get("like_count", 0)
+    comment_count: int = entry.get("comment_count", 0)
+    view_count: int = entry.get("view_count", 0)
+    all_comments: list[dict] = entry.get("all_comments", [])
+    original: dict | None = entry.get("original")
+    share_title: str = entry.get("share_title", "") or ""
+    share_summary: str = entry.get("share_summary", "") or ""
+
+    parts: list[str] = []
+    parts.append(f"## {dt_str}\n")
+
+    if content:
+        parts.append(content + "\n")
+
+    # 转发原文
+    if original:
+        if original.get("deleted"):
+            parts.append("> *（转发内容已删除）*\n")
+        else:
+            orig_content = (original.get("content") or "").strip()
+            orig_nick = original.get("nickname") or "未知用户"
+            if orig_content:
+                parts.append(f"> **转发自 {orig_nick}**：{orig_content}\n")
+            elif orig_nick:
+                parts.append(f"> **转发自 {orig_nick}**\n")
+
+    # 分享链接摘要
+    if share_title:
+        parts.append(f"> 🔗 **{share_title}**")
+        if share_summary:
+            parts.append(f"> {share_summary}")
+        parts.append("")
+
+    # 图片
+    if image_urls:
+        desc: str = img_cache.get(fid, "") if not no_vision else ""
+        parts.append(f"**图片**（共 {len(image_urls)} 张）：\n")
+        if desc:
+            parts.append(desc)
+        else:
+            for i, url in enumerate(image_urls):
+                parts.append(f"- 图片 {i+1}：{url}")
+        parts.append("")
+
+    # 互动数据
+    stats_parts = []
+    if like_count:
+        stats_parts.append(f"👍 {like_count}")
+    if comment_count:
+        stats_parts.append(f"💬 {comment_count}")
+    if view_count:
+        stats_parts.append(f"👁 {view_count}")
+    if stats_parts:
+        parts.append("**互动**：" + "  ".join(stats_parts) + "\n")
+
+    # 评论
+    if all_comments:
+        parts.append("**评论**：\n")
+        for c in all_comments:
+            nick = c.get("nickname") or "匿名"
+            c_content = (c.get("content") or "").strip()
+            c_ts = c.get("date", 0)
+            c_dt = _dt.datetime.fromtimestamp(c_ts).strftime("%m-%d %H:%M") if c_ts else ""
+            date_str = f" *{c_dt}*" if c_dt else ""
+            parts.append(f"- **{nick}**{date_str}：{c_content}")
+            replies: list[dict] = c.get("replies", [])
+            for r in replies:
+                r_nick = r.get("nickname") or "匿名"
+                r_content = (r.get("content") or "").strip()
+                r_ts = r.get("date", 0)
+                r_dt = _dt.datetime.fromtimestamp(r_ts).strftime("%m-%d %H:%M") if r_ts else ""
+                r_date_str = f" *{r_dt}*" if r_dt else ""
+                if r_content:
+                    parts.append(f"  - **{r_nick}**{r_date_str}：{r_content}")
+        parts.append("")
+
+    parts.append("---\n")
+    return "\n".join(parts)
 
 
 if __name__ == "__main__":
