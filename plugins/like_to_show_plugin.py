@@ -52,6 +52,7 @@ _STATE_FILENAME = "like_to_show_state.json"
 
 _VALID_METHODS = ("append", "delete", "comment", "new")
 _DEFAULT_EDIT_METHOD = "comment"
+_MAX_RETRIES = 5
 
 # 匹配 /like_to_show 10 或 /like_to_show 10 append 等写法
 _CMD_RE = re.compile(
@@ -393,6 +394,7 @@ async def process(
             "second_content": None,
             "registered_at": now,
             "warned_no_content": False,
+            "retry_count": 0,
         })
         pending_fids.add(fid)
         logger.info(
@@ -451,6 +453,7 @@ async def process(
             "second_content": None,
             "registered_at": now,
             "warned_no_content": False,
+            "retry_count": 0,
         })
         delay_pending_fids.add(fid)
         logger.info(
@@ -525,7 +528,20 @@ async def process(
         trigger_desc = f"点赞数：{current_likes} / 阈值：{threshold}"
         done = await _execute_item(item, owner_uin, cookie_file, send_notice, "like_to_show", trigger_desc)
         if not done:
-            still_pending.append(item)
+            item["retry_count"] = item.get("retry_count", 0) + 1
+            if item["retry_count"] >= _MAX_RETRIES:
+                logger.error(
+                    "like_to_show 说说 %s 执行失败已达 %d 次，放弃重试。",
+                    fid, _MAX_RETRIES,
+                )
+                if send_notice:
+                    await send_notice(
+                        f"❌ <b>like_to_show</b> 执行失败 {_MAX_RETRIES} 次，已放弃！\n"
+                        f"<i>fid: {_html.escape(fid)}</i>\n"
+                        f"请检查说说是否已被删除或 API 异常。"
+                    )
+            else:
+                still_pending.append(item)
             continue
 
         executed_count += 1
@@ -571,7 +587,20 @@ async def process(
         trigger_desc = f"延迟：{_format_delay(delay_seconds)}"
         done = await _execute_item(item, owner_uin, cookie_file, send_notice, "delay_to_show", trigger_desc)
         if not done:
-            still_delay_pending.append(item)
+            item["retry_count"] = item.get("retry_count", 0) + 1
+            if item["retry_count"] >= _MAX_RETRIES:
+                logger.error(
+                    "delay_to_show 说说 %s 执行失败已达 %d 次，放弃重试。",
+                    fid, _MAX_RETRIES,
+                )
+                if send_notice:
+                    await send_notice(
+                        f"❌ <b>delay_to_show</b> 执行失败 {_MAX_RETRIES} 次，已放弃！\n"
+                        f"<i>fid: {_html.escape(fid)}</i>\n"
+                        f"请检查说说是否已被删除或 API 异常。"
+                    )
+            else:
+                still_delay_pending.append(item)
             continue
 
         delay_executed_count += 1
