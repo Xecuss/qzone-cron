@@ -158,10 +158,7 @@ def make_send_notice(cfg: "TelegramConfig") -> SendNotice | None:
 
     async def send_notice(text: str) -> None:
         """发送全局通知到 Telegram。"""
-        try:
-            await _send_telegram(bot_token, chat_id, text)
-        except Exception as e:
-            logger.error("发送 Telegram 通知失败：%s", e)
+        await _send_telegram(bot_token, chat_id, text)
 
     return send_notice
 
